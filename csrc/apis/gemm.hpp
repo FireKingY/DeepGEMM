@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm100_mxfp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #endif 
 
@@ -15,6 +16,32 @@
 #include "layout.hpp"
 
 namespace deep_gemm::gemm {
+
+static void validate_mxfp4_grouped_contiguous_request(const int& arch_major,
+                                                    const torch::Tensor& a_tensor,
+                                                    const torch::Tensor& b_tensor,
+                                                    const torch::Tensor& d,
+                                                    const int& k,
+                                                    const int& gran_k_a,
+                                                    const int& gran_k_b,
+                                                    const cute::UMMA::Major& major_a,
+                                                    const cute::UMMA::Major& major_b,
+                                                    const bool& use_psum_layout) {
+    if (arch_major != 10)
+        DG_HOST_UNREACHABLE("Explicit MXFP4 grouped GEMM is only supported on SM100");
+    if (a_tensor.scalar_type() != kPackedFP4 or b_tensor.scalar_type() != kPackedFP4)
+        DG_HOST_UNREACHABLE("Explicit MXFP4 grouped GEMM requires both A and B to use packed FP4");
+    if (d.scalar_type() != torch::kBFloat16)
+        DG_HOST_UNREACHABLE("Explicit MXFP4 grouped GEMM currently only supports BF16 output");
+    if (gran_k_a != 32 or gran_k_b != 32)
+        DG_HOST_UNREACHABLE("Explicit MXFP4 grouped GEMM currently requires gran_k_a == 32 and gran_k_b == 32");
+    if (major_a != cute::UMMA::Major::K or major_b != cute::UMMA::Major::K)
+        DG_HOST_UNREACHABLE("Explicit MXFP4 grouped GEMM currently only supports K-major grouped contiguous inputs");
+    if (use_psum_layout)
+        DG_HOST_UNREACHABLE("Explicit MXFP4 grouped GEMM does not support psum layout in phase 1");
+    if (k % 256 != 0)
+        DG_HOST_UNREACHABLE("Explicit MXFP4 grouped GEMM currently requires K to be a multiple of 256");
+}
 
 static bool early_return(const int& m, const int &n, const int& k,
                          const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
@@ -150,7 +177,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const std::string& compiled_dims,
                                                  const bool& disable_ue8m0_cast,
                                                  const bool& use_psum_layout,
-                                                 const std::optional<int>& expected_m_for_psum_layout) {
+                                                 const std::optional<int>& expected_m_for_psum_layout,
+                                                 const bool& use_mxfp4 = false) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a.first);
     const auto& major_b = get_major_type_ab(b.first);
@@ -190,6 +218,11 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
         a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast);
 
+    const bool use_mxfp4_dispatch = use_mxfp4;
+    if (use_mxfp4_dispatch)
+        validate_mxfp4_grouped_contiguous_request(
+            arch_major, a.first, b.first, d, k, gran_k_a, gran_k_b, major_a, major_b, use_psum_layout);
+
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         const auto& major_sfb = get_major_type_ab(sfb);
@@ -197,9 +230,17 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
-                                                     num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
-                                                     compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+        if (use_mxfp4_dispatch) {
+            sm100_m_grouped_mxfp4_gemm_contiguous_1d1d(
+                a.first, sfa, b.first, sfb, d, grouped_layout,
+                num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
+                compiled_dims);
+        } else {
+            sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(
+                a.first, sfa, b.first, sfb, d, grouped_layout,
+                num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
+                compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -214,9 +255,11 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const std::pair<torch::Tensor, 
                                                  const std::optional<std::tuple<int, int>>& recipe_b,
                                                  const std::string& compiled_dims,
                                                  const bool& disable_ue8m0_cast,
-                                                 const bool& use_psum_layout) {
+                                                 const bool& use_psum_layout,
+                                                 const bool& use_mxfp4 = false) {
     m_grouped_fp8_fp4_gemm_nt_contiguous(a, {b.first.transpose(1, 2), b.second.transpose(1, 2)},
-                                         d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, std::nullopt);
+                                         d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims,
+                                         disable_ue8m0_cast, use_psum_layout, std::nullopt, use_mxfp4);
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -628,14 +671,16 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false,
-          py::arg("expected_m_for_psum_layout") = std::nullopt);
+          py::arg("expected_m_for_psum_layout") = std::nullopt,
+          py::arg("use_mxfp4") = false);
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous", &m_grouped_fp8_fp4_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false,
-          py::arg("use_psum_layout") = false);
+          py::arg("use_psum_layout") = false,
+          py::arg("use_mxfp4") = false);
     m.def("m_grouped_fp8_fp4_gemm_nt_masked", &m_grouped_fp8_fp4_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,

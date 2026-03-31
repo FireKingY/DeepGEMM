@@ -58,6 +58,7 @@ struct SM100ArchSpec {
         switch (mma_kind) {
             case MmaKind::BF16:     return {0, 0};
             case MmaKind::MXFP8FP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
+            case MmaKind::MXFP4:    return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
             default: DG_HOST_UNREACHABLE("Unknown dtype");
         }
     }
@@ -132,9 +133,15 @@ struct SM100ArchSpec {
         int smem_sfa_per_stage = 0;
         int smem_sfb_per_stage = 0;
         if (kernel_type == KernelType::Kernel1D1D) {
-            const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind);
-            smem_sfa_per_stage = sf_block_m * 4;
-            smem_sfb_per_stage = sf_block_n * 4;
+            if (mma_kind == MmaKind::MXFP4) {
+                const auto packed_sf_k_per_row = block_k / 128;
+                smem_sfa_per_stage = block_m * packed_sf_k_per_row * 4 * 2;
+                smem_sfb_per_stage = align(block_n, 128) * packed_sf_k_per_row * 4 * 2;
+            } else {
+                const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind);
+                smem_sfa_per_stage = sf_block_m * 4;
+                smem_sfb_per_stage = sf_block_n * 4;
+            }
         } else {
             smem_sfa_per_stage = block_m * 4;
             smem_sfb_per_stage = 0;

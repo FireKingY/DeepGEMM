@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include <deep_gemm/common/types.hpp>
 
 #include "../../utils/math.hpp"
@@ -112,7 +114,9 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
     const int& swizzle_cd_mode = ArchSpec::enable_cd_swizzle(cd_dtype) ? get_swizzle_mode(block_n, cd_elem_size) : 0;
 
     // Different archs have different epilogue pipelines
-    const int& smem_cd = ArchSpec::get_smem_cd_size(kernel_type, block_m, block_n, swizzle_cd_mode, cd_dtype);
+    int smem_cd = ArchSpec::get_smem_cd_size(kernel_type, block_m, block_n, swizzle_cd_mode, cd_dtype);
+    if (mma_kind == MmaKind::MXFP4)
+        smem_cd /= 2;
 
     // A/B shared memory
     const int& smem_a_per_stage = load_block_m * block_k * ab_elem_size;
@@ -154,13 +158,19 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& a_dtype, const at::ScalarType& b_dtype,
                                   const at::ScalarType& cd_dtype,
-                                  const bool& with_accumulation, const int& num_sms) {
-    const auto mma_kind = (a_dtype == torch::kBFloat16 ? MmaKind::BF16 : MmaKind::MXFP8FP4);
+                                  const bool& with_accumulation, const int& num_sms,
+                                  const std::optional<MmaKind>& mma_kind_override = std::nullopt) {
+    const auto mma_kind = mma_kind_override.has_value() ? mma_kind_override.value() :
+        (a_dtype == torch::kBFloat16 ? MmaKind::BF16 : MmaKind::MXFP8FP4);
     if (mma_kind == MmaKind::BF16) {
         DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
-    } else {
+    } else if (mma_kind == MmaKind::MXFP8FP4) {
         DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
         DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);
+    } else if (mma_kind == MmaKind::MXFP4) {
+        DG_HOST_ASSERT(a_dtype == kPackedFP4 and b_dtype == kPackedFP4);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported MMA kind");
     }
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
@@ -171,6 +181,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     if (gemm_type == GemmType::MGroupedMasked or gemm_type == GemmType::MGroupedContiguousWithPsumLayout) 
         block_ms = std::vector{64, 128};    // Exclude 256 for performance
     auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype);
+    if (mma_kind == MmaKind::MXFP4)
+        block_ns = std::vector{128};
 
     // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
     // TODO: Optimize it
@@ -180,7 +192,13 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         block_ns = std::vector{128};
 
     // K block size is selected in a fixed manner
-    const auto& block_k = (mma_kind == MmaKind::BF16 ? 64 : 128);
+    int block_k = 0;
+    switch (mma_kind) {
+        case MmaKind::BF16:     block_k = 64; break;
+        case MmaKind::MXFP8FP4: block_k = 128; break;
+        case MmaKind::MXFP4:    block_k = 256; break;
+        default: DG_HOST_UNREACHABLE("Unsupported MMA kind");
+    }
 
     // Some util functions
     const auto& get_num_blocks = [=](const int& block_m, const int& block_n) {
@@ -283,7 +301,6 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         num_min_sms = align(num_min_sms, best_multicast_config.num_multicast);
         DG_HOST_ASSERT(num_min_sms <= num_sms);
     }
-
     const auto& config = GemmConfig {
         .gemm_type = gemm_type,
         .kernel_type = kernel_type,

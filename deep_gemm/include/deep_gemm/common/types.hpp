@@ -5,12 +5,14 @@ namespace deep_gemm {
 enum class MmaKind {
     BF16        = 0,
     MXFP8FP4    = 1,
+    MXFP4       = 2,
 };
 
 constexpr __host__ __device__ int get_element_size(const MmaKind& mma_kind) {
     switch (mma_kind) {
         case MmaKind::BF16:     return 2;
         case MmaKind::MXFP8FP4: return 1;
+        case MmaKind::MXFP4:    return 1;
         default: return 0;
     }
 }

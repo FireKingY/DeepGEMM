@@ -153,7 +153,9 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                          const std::string& compiled_dims,
                                                          const bool& use_psum_layout,
-                                                         const std::optional<int>& expected_m_for_psum_layout) {
+                                                         const std::optional<int>& expected_m_for_psum_layout,
+                                                         const std::optional<MmaKind>& mma_kind_override = std::nullopt,
+                                                         const std::optional<std::string>& runtime_name_override = std::nullopt) {
     const auto& gemm_type = use_psum_layout ? GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
 
     // NOTES: If actual M is dynamic, estimate config via `num_groups` and `expected_m`.
@@ -166,7 +168,7 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         m_for_config, n, k, num_groups_for_config, major_a, major_b,
         a.scalar_type(), b.scalar_type(),
         d.scalar_type(), false,
-        device_runtime->get_num_sms());
+        device_runtime->get_num_sms(), mma_kind_override);
 
     // Create tensor descriptors
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
@@ -209,7 +211,8 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .tensor_map_cd = tensor_map_cd
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
-    const auto& runtime = compiler->build("sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d", code);
+    const auto& runtime = compiler->build(
+        runtime_name_override.value_or("sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d"), code);
     SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
 }
 

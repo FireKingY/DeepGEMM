@@ -1,5 +1,6 @@
 import copy
 import numpy as np
+import pytest
 import random
 import torch
 
@@ -11,7 +12,7 @@ from deep_gemm.testing import (
 )
 
 from generators import (
-    KernelType, get_ue8m0_usage, layout_masked_to_psum, align,
+    KernelType, QuantConfig, MajorTypeAB, get_ue8m0_usage, layout_masked_to_psum, align,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
 )
@@ -96,6 +97,125 @@ def test_m_grouped_gemm_contiguous() -> None:
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
     print()
+
+
+def test_m_grouped_mxfp4_uniform_sanity() -> None:
+    if get_arch_major() != 10:
+        return
+
+    m_per = 128
+    num_groups = 4
+    m = m_per * num_groups
+    n = 128
+    k = 256
+    a_bf16 = torch.ones((m, k), device='cuda', dtype=torch.bfloat16)
+    b_bf16 = torch.stack([torch.full((n, k), float(i + 1), device='cuda', dtype=torch.bfloat16) for i in range(num_groups)])
+    a = deep_gemm.utils.per_token_cast_to_fp4(a_bf16, use_ue8m0=True, gran_k=32)
+    packed_b = [deep_gemm.utils.per_token_cast_to_fp4(b_bf16[i], use_ue8m0=True, gran_k=32) for i in range(num_groups)]
+    b = (torch.stack([x[0] for x in packed_b]), torch.stack([x[1] for x in packed_b]))
+    grouped_layout = torch.empty((m,), device='cuda', dtype=torch.int32)
+    ref = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    start = 0
+    for i in range(num_groups):
+        grouped_layout[start: start + m_per] = i
+        ref[start: start + m_per] = (a_bf16[start: start + m_per] @ b_bf16[i].t()).to(torch.bfloat16)
+        start += m_per
+    d = torch.empty_like(ref)
+    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        a, b, d, grouped_layout,
+        disable_ue8m0_cast=False,
+        use_psum_layout=False,
+        recipe=None, recipe_a=(1, 32), recipe_b=(1, 32),
+        use_mxfp4=True)
+    assert calc_diff(d, ref) == 0.0
+
+
+@torch.inference_mode()
+def test_m_grouped_mxfp4_gemm_contiguous() -> None:
+    if get_arch_major() != 10:
+        return
+
+    print('Testing explicit MXFP4 m-grouped contiguous GEMM:')
+    quant_config = QuantConfig((32, 32, True, True))
+    recipe, recipe_a, recipe_b = quant_config.get_recipes()
+
+    m, a, b, grouped_layout, d, ref_d = generate_m_grouped_contiguous(
+        1, 128, 128, 256,
+        MajorTypeAB.KMajor, MajorTypeAB.KMajor,
+        use_ue8m0=True, use_psum_layout=False,
+        quant_config=quant_config)
+    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        a, b, d, grouped_layout,
+        disable_ue8m0_cast=False,
+        use_psum_layout=False,
+        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+        use_mxfp4=True)
+    diff = calc_diff(d, ref_d)
+    assert diff < quant_config.max_diff(), f'{m=}, {diff:.5f}'
+
+    print()
+
+
+def test_m_grouped_mxfp4_hard_errors() -> None:
+    if get_arch_major() != 10:
+        return
+
+    quant_config = QuantConfig((32, 32, True, True))
+    recipe, recipe_a, recipe_b = quant_config.get_recipes()
+
+    m, a, b, grouped_layout, d, _ = generate_m_grouped_contiguous(
+        4, 8192, 128, 256,
+        MajorTypeAB.KMajor, MajorTypeAB.KMajor,
+        use_ue8m0=True, use_psum_layout=False,
+        quant_config=quant_config)
+
+    try:
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+            a, b, d, grouped_layout,
+            disable_ue8m0_cast=False,
+            use_psum_layout=True,
+            recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+            use_mxfp4=True)
+        raise AssertionError('Expected explicit MXFP4 psum-layout request to hard fail')
+    except RuntimeError:
+        pass
+
+    m_bad, a_bad, b_bad, grouped_layout_bad, d_bad, _ = generate_m_grouped_contiguous(
+        4, 8192, 128, 384,
+        MajorTypeAB.KMajor, MajorTypeAB.KMajor,
+        use_ue8m0=True, use_psum_layout=False,
+        quant_config=quant_config)
+    try:
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+            a_bad, b_bad, d_bad, grouped_layout_bad,
+            disable_ue8m0_cast=False,
+            use_psum_layout=False,
+            recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+            use_mxfp4=True)
+        raise AssertionError('Expected explicit MXFP4 unsupported-N request to hard fail')
+    except RuntimeError:
+        pass
+
+
+def test_m_grouped_fp4_non_optin_legacy_regression() -> None:
+    if get_arch_major() != 10:
+        return
+
+    quant_config = QuantConfig((32, 32, True, True))
+    recipe, recipe_a, recipe_b = quant_config.get_recipes()
+    m, a, b, grouped_layout, d, ref_d = generate_m_grouped_contiguous(
+        4, 8192, 128, 256,
+        MajorTypeAB.KMajor, MajorTypeAB.KMajor,
+        use_ue8m0=True, use_psum_layout=False,
+        quant_config=quant_config)
+    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+        a, b, d, grouped_layout,
+        disable_ue8m0_cast=False,
+        use_psum_layout=False,
+        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+        use_mxfp4=False)
+    diff = calc_diff(d, ref_d)
+    assert diff < quant_config.max_diff(), f'legacy non-opt-in path regressed: {diff:.5f}'
 
 
 def test_m_grouped_gemm_masked() -> None:

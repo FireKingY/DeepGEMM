@@ -51,3 +51,37 @@ These were measured before the formal loop and are kept here only as context.
 | `block_n=48` | `4` | `628.13` | slower despite higher stage count |
 | `block_n=64` | `3` | `614.88` | slower; `swizzle_cd` stayed at `128B` |
 | `block_n=112` | `3` | `422.55` | current baseline |
+
+## Main Kernel Target
+
+- objective switched to main kernel only
+- target: `300 us`
+- measurement source: NCU `Duration` for `sm100_mxfp4_gemm_1d1d_impl`
+
+### Main Kernel Chart
+
+```mermaid
+xychart-beta
+    title "MXFP4 Main Kernel Duration By Round"
+    x-axis ["mk-baseline", "mk-r4", "mk-r6", "mk-r9", "mk-r10", "mk-r11", "mk-r12"]
+    y-axis "Duration (us)" 280 --> 365
+    bar [339.94, 344.29, 349.79, 360.90, 345.73, 338.88, 336.99]
+```
+
+### Main Kernel Round Log
+
+| Round | Change | Correctness | Main Kernel Perf (us) | Result |
+| --- | --- | --- | ---: | --- |
+| mk-baseline | current accepted config `block_n=128`, `stages=3` | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `339.94` | baseline |
+| mk-r1 | force MXFP4 `block_n=192` | `calc_diff=0.08014280`, `cos=0.91986656`, `max_abs_diff=455.25` | `n/a` | reject: correctness fail |
+| mk-r2 | reduce SM100 MXFP4 non-epilogue threads from `128` to `96` | `calc_diff=0.99995519`, `cos=0.00004481`, `max_abs_diff=720.0` | `n/a` | reject: correctness fail |
+| mk-r3 | retry `block_n=192` with SFB TMA tile width aligned to `128` | `n/a` | `n/a` | reject: runtime hang / deadlock |
+| mk-r4 | derive SFA/SFB TMEM column counts from CUTLASS fragment/layout instead of fixed `14/30` | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `344.29` | reject: slower than baseline |
+| mk-r5 | force MXFP4 `block_k=128` | `n/a` | `n/a` | reject: JIT compile failed; current MXFP4 TMA/UMMA layout requires `BLOCK_K=256` |
+| mk-r6 | align MXFP4 SF transpose/fence ordering with FP8 kernel | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `349.79` | reject: slower than baseline |
+| mk-r7 | add minimal `block_n=192` SFB special handling: aligned SFB TMA tile, wider SFB load, odd-tile TMEM offset | `calc_diff=0.04954704`, `cos=0.95132226`, `max_abs_diff=201.0` | `n/a` | reject: correctness fail; N192 support still incomplete |
+| mk-r8 | retry `block_n=192` with CUTLASS-inspired parity-aware SFB placement into the 256-wide buffer | `calc_diff=0.04288156`, `cos=0.95730627`, `max_abs_diff=308.0` | `n/a` | reject: correctness fail; still missing full CUTLASS SFB reshape semantics |
+| mk-r9 | set MXFP4 A/B TMA descriptor `L2 promotion` from `L2_256B` to `NONE` | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `360.90` | reject: slower than baseline |
+| mk-r10 | keep MXFP4 B TMA descriptor at `L2_256B`, set only A TMA descriptor `L2 promotion` to `NONE` | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `345.73` | reject: slower than baseline |
+| mk-r11 | force explicit MXFP4 grouped-contiguous dispatch to use `compiled_dims=''` instead of inheriting the generic `nk` default | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `338.88` | reject: gain stayed within noise floor; same-GPU control probe with explicit `nk` was `337.98` |
+| mk-r12 | set per-kernel launch cache config to `PreferShared` in the JIT launch handle; NCU confirmed `launch__func_cache_config=CachePreferShared` | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `336.99` | accept: repeated NCU runs were `337.15` and `336.83` |

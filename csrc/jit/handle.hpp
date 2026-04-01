@@ -36,6 +36,7 @@ static auto lazy_##name(Args&&... args) -> decltype(name(args...)) { \
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorName);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorString);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuFuncSetAttribute);
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuFuncSetCacheConfig);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleLoad);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleUnload);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleGetFunction);
@@ -74,6 +75,7 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                   const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim) {
     if (smem_size > 0)
         DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    DG_CUDA_RUNTIME_CHECK(cudaFuncSetCacheConfig(kernel, cudaFuncCachePreferShared));
 
     LaunchConfigHandle config;
     config.gridDim = grid_dim;
@@ -132,6 +134,7 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                  const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim) {
     if (smem_size > 0)
         DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
+    DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetCacheConfig(kernel, CU_FUNC_CACHE_PREFER_SHARED));
 
     LaunchConfigHandle config;
     config.gridDimX = grid_dim.x;

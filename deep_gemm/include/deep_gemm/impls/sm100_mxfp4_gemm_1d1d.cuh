@@ -10,6 +10,7 @@
 #include <cutlass/detail/sm100_blockscaled_layout.hpp>
 
 #include <deep_gemm/common/epilogue_utils.cuh>
+#include <deep_gemm/common/profiler.h>
 #include <deep_gemm/common/scheduler.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/sm100_utils.cuh>
@@ -113,6 +114,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_mxfp4_gemm_1d1d_impl(int* grouped_layout,
                            uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                           int64_t* profiler_ptr, int64_t num_entries,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
@@ -159,6 +161,23 @@ sm100_mxfp4_gemm_1d1d_impl(int* grouped_layout,
     bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
     const auto lane_idx = get_lane_idx();
+    constexpr int64_t kNumProfilerSlotsPerCTA = (kNumNonEpilogueThreads + kNumEpilogueThreads) / 32;
+
+    Profiler profiler;
+    const bool is_profile_lane = lane_idx == 0 and profiler_ptr != nullptr and num_entries > 0;
+    if (is_profile_lane) {
+        profiler.init(profiler_ptr, 1 + num_entries * 4,
+                      static_cast<int64_t>(blockIdx.x) * kNumProfilerSlotsPerCTA + warp_idx,
+                      num_entries);
+    }
+    const auto profile_instant = [&](ProfilerTag tag, int64_t start) {
+        if (is_profile_lane)
+            profiler.record(tag, start, 0);
+    };
+    const auto profile_duration = [&](ProfilerTag tag, int64_t start, int64_t end) {
+        if (is_profile_lane)
+            profiler.record(tag, start, end - start);
+    };
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
@@ -271,6 +290,8 @@ sm100_mxfp4_gemm_1d1d_impl(int* grouped_layout,
             const auto& num_total_k_blocks = ceil_div(scheduler.current_shape_k, BLOCK_K);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
+                const auto load_wait_empty_end = is_profile_lane ? globaltimer() : 0;
+                profile_instant(LoadWaitEmpty, load_wait_empty_end);
 
                 uint32_t m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), IndexType::MN>(shape_m, BLOCK_M, m_block_idx);
                 uint32_t n_idx = scheduler.template get_global_idx<true, IndexType::MN>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
@@ -299,6 +320,8 @@ sm100_mxfp4_gemm_1d1d_impl(int* grouped_layout,
                 }
 
                 full_barriers[stage_idx]->arrive_and_expect_tx(num_arrival_bytes);
+                const auto load_tma_issue = is_profile_lane ? globaltimer() : 0;
+                profile_instant(LoadTmaIssue, load_tma_issue);
             }
         }
     } else if (warp_idx == 1 and is_leader_cta) {
@@ -377,6 +400,7 @@ sm100_mxfp4_gemm_1d1d_impl(int* grouped_layout,
                 with_sf_full_barriers[stage_idx]->wait(phase);
                 tcgen05_after_thread_sync();
 
+                const auto utccp_start = is_profile_lane ? globaltimer() : 0;
                 if (cute::elect_one_sync()) {
                     auto tCsSFA = tCsSFA_all(cute::_, cute::_, cute::_, stage_idx);
                     auto tCsSFB = tCsSFB_all(cute::_, cute::_, cute::_, stage_idx);
@@ -388,9 +412,13 @@ sm100_mxfp4_gemm_1d1d_impl(int* grouped_layout,
                     cute::copy(tiled_copy_s2t_SFB, thr_tCsSFB_compact_s2t, thr_tCtSFB_compact_s2t);
                 }
                 __syncwarp();
+                const auto utccp_end = is_profile_lane ? globaltimer() : 0;
+                profile_duration(UtccpScale, utccp_start, utccp_end);
 
                 const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
                 const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(stage_idx));
+                const auto umma_start = is_profile_lane ? globaltimer() : 0;
+                profile_instant(Umma, umma_start);
                 if (cute::elect_one_sync()) {
                     #pragma unroll
                     for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
@@ -433,14 +461,19 @@ sm100_mxfp4_gemm_1d1d_impl(int* grouped_layout,
             const auto& num_total_k_blocks = ceil_div(scheduler.current_shape_k, BLOCK_K);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 full_barriers[stage_idx]->wait(phase);
+                const auto sf_wait_full_end = is_profile_lane ? globaltimer() : 0;
+                profile_instant(SfWaitFull, sf_wait_full_end);
                 cutlass::arch::fence_view_async_shared();
 
+                const auto sf_transpose_start = is_profile_lane ? globaltimer() : 0;
                 #pragma unroll
                 for (uint32_t i = 0; i < SF_PACKED_K_PER_ROW; ++ i) {
                     utccp_required_smem_warp_transpose(smem_sfa[stage_idx] + i * kNumUTCCPAlignedElems);
                     utccp_required_smem_warp_transpose(smem_sfb[stage_idx] + i * kNumUTCCPAlignedElems);
                 }
                 __syncwarp();
+                const auto sf_transpose_end = is_profile_lane ? globaltimer() : 0;
+                profile_duration(SfTranspose, sf_transpose_start, sf_transpose_end);
 
                 with_sf_full_barriers[stage_idx]->arrive(0u);
             }
@@ -530,6 +563,8 @@ sm100_mxfp4_gemm_1d1d_impl(int* grouped_layout,
         if (epilogue_warp_idx == kNumUMMAStoreThreads / 32 - 1)
             Allocator().free(0, kNumTmemCols);
     }
+    if (is_profile_lane)
+        profiler.flush();
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");

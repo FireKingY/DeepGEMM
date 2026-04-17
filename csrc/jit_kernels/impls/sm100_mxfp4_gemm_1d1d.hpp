@@ -99,6 +99,8 @@ public:
         LaunchArgs launch_args;
 
         void* grouped_layout;
+        int64_t* profiler_ptr;
+        int64_t num_entries;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_sfa;
@@ -148,6 +150,7 @@ static void __instantiate_kernel() {{
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.grouped_layout, args.m, args.n, args.k,
+            args.profiler_ptr, args.num_entries,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
             args.tensor_map_cd));
@@ -161,13 +164,34 @@ static void sm100_m_grouped_mxfp4_gemm_contiguous_1d1d(const torch::Tensor& a, c
                                                         const int& num_groups, const int& m, const int& n, const int& k,
                                                         const int& gran_k_a, const int& gran_k_b,
                                                         const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                                        const std::string& compiled_dims) {
+                                                        const std::string& compiled_dims,
+                                                        const std::optional<torch::Tensor>& profiler = std::nullopt) {
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::MGroupedContiguous, KernelType::Kernel1D1D,
         m, n, k, num_groups, major_a, major_b,
         a.scalar_type(), b.scalar_type(),
         d.scalar_type(), false,
         device_runtime->get_num_sms(), std::optional<MmaKind>(MmaKind::MXFP4));
+
+    int64_t* profiler_ptr = nullptr;
+    int64_t num_entries = 0;
+    if (profiler.has_value()) {
+        const auto& profiler_tensor = profiler.value();
+        DG_HOST_ASSERT(profiler_tensor.is_cuda());
+        DG_HOST_ASSERT(profiler_tensor.scalar_type() == torch::kInt64);
+        DG_HOST_ASSERT(profiler_tensor.dim() == 2);
+        DG_HOST_ASSERT(profiler_tensor.is_contiguous());
+        DG_HOST_ASSERT(profiler_tensor.size(1) >= 5);
+        DG_HOST_ASSERT((profiler_tensor.size(1) - 1) % 4 == 0);
+        DG_HOST_ASSERT(profiler_tensor.get_device() == a.get_device());
+
+        const auto required_rows = static_cast<int64_t>(config.num_sms) *
+                                   static_cast<int64_t>(config.thread_config.num_threads / 32);
+        DG_HOST_ASSERT(profiler_tensor.size(0) >= required_rows);
+
+        profiler_ptr = profiler_tensor.data_ptr<int64_t>();
+        num_entries = (profiler_tensor.size(1) - 1) / 4;
+    }
 
     const auto& tensor_map_a = make_mxfp4_tma_a_desc(major_a, a, m, k,
                                                      SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
@@ -200,6 +224,8 @@ static void sm100_m_grouped_mxfp4_gemm_contiguous_1d1d(const torch::Tensor& a, c
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
         .grouped_layout = grouped_layout.data_ptr(),
+        .profiler_ptr = profiler_ptr,
+        .num_entries = num_entries,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,

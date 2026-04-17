@@ -178,7 +178,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const bool& disable_ue8m0_cast,
                                                  const bool& use_psum_layout,
                                                  const std::optional<int>& expected_m_for_psum_layout,
-                                                 const bool& use_mxfp4 = false) {
+                                                 const bool& use_mxfp4 = false,
+                                                 const std::optional<torch::Tensor>& profiler = std::nullopt) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a.first);
     const auto& major_b = get_major_type_ab(b.first);
@@ -222,6 +223,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     if (use_mxfp4_dispatch)
         validate_mxfp4_grouped_contiguous_request(
             arch_major, a.first, b.first, d, k, gran_k_a, gran_k_b, major_a, major_b, use_psum_layout);
+    if (profiler.has_value())
+        DG_HOST_ASSERT(use_mxfp4_dispatch and arch_major == 10 and sfa.scalar_type() == torch::kInt);
 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
@@ -234,7 +237,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
             sm100_m_grouped_mxfp4_gemm_contiguous_1d1d(
                 a.first, sfa, b.first, sfb, d, grouped_layout,
                 num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
-                compiled_dims);
+                compiled_dims, profiler);
         } else {
             sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(
                 a.first, sfa, b.first, sfb, d, grouped_layout,
@@ -256,10 +259,11 @@ static void m_grouped_fp8_fp4_gemm_nn_contiguous(const std::pair<torch::Tensor, 
                                                  const std::string& compiled_dims,
                                                  const bool& disable_ue8m0_cast,
                                                  const bool& use_psum_layout,
-                                                 const bool& use_mxfp4 = false) {
+                                                 const bool& use_mxfp4 = false,
+                                                 const std::optional<torch::Tensor>& profiler = std::nullopt) {
     m_grouped_fp8_fp4_gemm_nt_contiguous(a, {b.first.transpose(1, 2), b.second.transpose(1, 2)},
                                          d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims,
-                                         disable_ue8m0_cast, use_psum_layout, std::nullopt, use_mxfp4);
+                                         disable_ue8m0_cast, use_psum_layout, std::nullopt, use_mxfp4, profiler);
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -672,7 +676,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false,
           py::arg("expected_m_for_psum_layout") = std::nullopt,
-          py::arg("use_mxfp4") = false);
+          py::arg("use_mxfp4") = false,
+          py::arg("profiler") = std::nullopt);
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous", &m_grouped_fp8_fp4_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
@@ -680,7 +685,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false,
           py::arg("use_psum_layout") = false,
-          py::arg("use_mxfp4") = false);
+          py::arg("use_mxfp4") = false,
+          py::arg("profiler") = std::nullopt);
     m.def("m_grouped_fp8_fp4_gemm_nt_masked", &m_grouped_fp8_fp4_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,

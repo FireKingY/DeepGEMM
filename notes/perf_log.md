@@ -63,9 +63,9 @@ These were measured before the formal loop and are kept here only as context.
 ```mermaid
 xychart-beta
     title "MXFP4 Main Kernel Duration By Round"
-    x-axis ["mk-baseline", "mk-r4", "mk-r6", "mk-r9", "mk-r10", "mk-r11", "mk-r12"]
-    y-axis "Duration (us)" 280 --> 365
-    bar [339.94, 344.29, 349.79, 360.90, 345.73, 338.88, 336.99]
+    x-axis ["mk-baseline", "mk-r4", "mk-r6", "mk-r9", "mk-r10", "mk-r11", "mk-r12", "mk-r13", "mk-r14", "mk-r15", "mk-r16", "mk-r17", "mk-r19", "mk-r20", "mk-r21", "mk-r24", "mk-r25", "mk-r26", "mk-r27", "mk-r28", "mk-r29", "mk-r30", "mk-r31", "mk-r32", "mk-r33", "mk-r34", "mk-r35"]
+    y-axis "Duration (us)" 280 --> 400
+    bar [339.94, 344.29, 349.79, 360.90, 345.73, 338.88, 336.99, 337.25, 337.63, 339.04, 392.10, 339.52, 339.84, 337.54, 338.30, 427.62, 339.81, 337.38, 338.30, 338.37, 337.44, 352.29, 352.06, 352.93, 351.42, 374.18, 351.55]
 ```
 
 ### Main Kernel Round Log
@@ -85,3 +85,26 @@ xychart-beta
 | mk-r10 | keep MXFP4 B TMA descriptor at `L2_256B`, set only A TMA descriptor `L2 promotion` to `NONE` | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `345.73` | reject: slower than baseline |
 | mk-r11 | force explicit MXFP4 grouped-contiguous dispatch to use `compiled_dims=''` instead of inheriting the generic `nk` default | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `338.88` | reject: gain stayed within noise floor; same-GPU control probe with explicit `nk` was `337.98` |
 | mk-r12 | set per-kernel launch cache config to `PreferShared` in the JIT launch handle; NCU confirmed `launch__func_cache_config=CachePreferShared` | `calc_diff=0.01337715`, `cos=0.98669684`, `max_abs_diff=82.5` | `336.99` | accept: repeated NCU runs were `337.15` and `336.83` |
+| mk-r13 | switch per-kernel launch cache config from `PreferShared` to `PreferEqual` | `calc_diff=0.01337715` | `337.25` | reject: repeated NCU runs diverged to `336.54` and `337.95`; average regressed vs `mk-r12` |
+| mk-r14 | force explicit MXFP4 grouped-contiguous dispatch back to `compiled_dims=''` while keeping the accepted `PreferShared` launch cache config | `1 passed, 7 deselected` | `337.63` | reject: same knob stayed slower than the `mk-r12` baseline on GPU2 |
+| mk-r15 | force explicit MXFP4 grouped-contiguous dispatch to compile `m/n/k` as static template dimensions (`compiled_dims=\"mnk\"`) | `1 passed, 7 deselected` | `339.04` | reject: fully static shape specialization regressed the main kernel on GPU2 |
+| mk-r16 | clamp explicit MXFP4 grouped-contiguous `num_sms` from the full device count down to `128` following CUTLASS-style `max_sm_count` tuning | `1 passed, 7 deselected` | `392.10` | reject: grid dropped to `128` as intended, but under-filled the persistent schedule and regressed badly |
+| mk-r17 | force NVCC JIT target from Blackwell family `sm_100f` back to exact `sm_100a` for this runtime codegen path | `1 passed, 7 deselected` | `339.52` | reject: exact-arch codegen produced slower SASS than the family target |
+| mk-r18 | switch the JIT compiler default from `NVCC` to `NVRTC` | `compile fail` | `n/a` | reject: NVRTC could not find `cuda/std/cstdint` in the current include path setup, so this backend cannot be evaluated as-is |
+| mk-r19 | set `PreferredSharedMemoryCarveout=100` on top of the accepted `CachePreferShared` launch config | `1 passed, 7 deselected` | `339.84` | reject: explicit carveout did not improve over the existing `PreferShared` baseline |
+| mk-r20 | remove the global `ptxas --register-usage-level=10` flag to give the compiler more register/scheduling freedom | `1 passed, 7 deselected` | `337.54` | reject: repeated NCU runs were `337.73` and `337.34`, and register usage rose to `51/thread` without beating `mk-r12` |
+| mk-r21 | fully enable the NVRTC backend by adding the missing `cccl` include path and switching the default JIT compiler to `NVRTC` | `1 passed, 7 deselected` | `338.30` | reject: NVRTC became functional, but the generated kernel still regressed vs the accepted NVCC baseline |
+| mk-r22 | increase MXFP4 grouped-contiguous non-epilogue threads from `128` to `160` while keeping epilogue threads at the required `128` | `calc_diff=1.01035` | `n/a` | reject: correctness failed hard, so higher producer/compute thread count is not viable in this kernel |
+| mk-r23 | force MXFP4 grouped-contiguous `block_n=112` while keeping the current kernel implementation and launch policy unchanged | `1 passed, 7 deselected` | `383.17` | reject: the smaller `N` tile preserved `3` stages but caused a large main-kernel regression |
+| mk-r24 | force MXFP4 grouped-contiguous `block_n=96` while keeping the current kernel implementation and launch policy unchanged | `1 passed, 7 deselected` | `427.62` | reject: shrinking the `N` tile further caused an even larger main-kernel regression |
+| mk-r25 | change explicit MXFP4 grouped-contiguous shape specialization from the default `nk` to only `k` | `1 passed, 7 deselected` | `339.81` | reject: dropping `n` specialization regressed the main kernel |
+| mk-r26 | change explicit MXFP4 grouped-contiguous shape specialization from the default `nk` to only `n` | `1 passed, 7 deselected` | `337.38` | reject: removing `k` specialization still failed to beat the accepted `nk` baseline |
+| mk-r27 | set per-kernel shared-memory bank size preference to `8-byte` on both runtime and driver launch paths | `1 passed, 7 deselected` | `338.30` | reject: the bank-width override remained slower than the accepted baseline |
+| mk-r28 | switch the per-kernel cache preference from `PreferShared` to `PreferL1` | `1 passed, 7 deselected` | `338.37` | reject: `CachePreferL1` stayed slower than the accepted `PreferShared` baseline |
+| mk-r29 | change explicit MXFP4 grouped-contiguous shape specialization from the default `nk` to `mn` | `1 passed, 7 deselected` | `337.44` | reject: specializing `m/n` produced a different template instantiation but still regressed vs `mk-r12` |
+| mk-r30 | add launch-level `PreferredSharedMemoryCarveout=100` on top of the accepted `CachePreferShared` baseline | `1 passed, 7 deselected` | `352.29` | reject: launch-attribute carveout overrode the baseline policy and regressed badly |
+| mk-r31 | add NVCC `--extra-device-vectorization` to the JIT compiler flags | `1 passed, 7 deselected` | `352.06` | reject: the extra vectorization pass increased register pressure to `51/thread` and regressed badly |
+| mk-r32 | change explicit MXFP4 grouped-contiguous shape specialization from the default `nk` to only `m` | `1 passed, 7 deselected` | `352.93` | reject: specializing only `m` produced the worst of the recent shape-specialization variants |
+| mk-r33 | add launch-level `access policy window` to mark the MXFP4 grouped `A` tensor as streaming | `1 passed, 7 deselected` | `351.42` | reject: the L2 streaming hint was directionally better than the recent `352+ us` regressions, but still far below the accepted baseline |
+| mk-r34 | set persisting L2 cache to the device max and mark the MXFP4 grouped `B` tensor as persisting | `1 passed, 7 deselected` | `374.18` | reject: NCU confirmed `launch__persisting_l2_cache_size=82.9 MB`, but the persisting hint heavily regressed this workload |
+| mk-r35 | set `cudaLimitMaxL2FetchGranularity=128` before the explicit MXFP4 grouped launch | `1 passed, 7 deselected` | `351.55` | reject: the L2 fetch granularity hint had no useful effect and remained far slower than the accepted baseline |

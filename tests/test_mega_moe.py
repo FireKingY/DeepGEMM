@@ -151,6 +151,66 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist.destroy_process_group()
         return
 
+    # NVML host-side monitoring path: runs the four experiments (violation
+    # scatter, polled clock/throttle, polled power, locked-clock compare) and
+    # writes per-rank CSVs. Skips the baseline/correctness/kineto paths since
+    # they are not needed for NVML reads.
+    if args.nvml_monitor:
+        import sys as _sys
+        _sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        try:
+            from nvml_monitor import NvmlMonitorConfig, run_nvml_monitor, NvmlUnavailable
+        except Exception as _ex:
+            dist_print(f'NVML monitoring requested but helper failed to import: {_ex}',
+                       once_in_node=True)
+            dist.barrier()
+            buffer.destroy()
+            dist.destroy_process_group()
+            return
+
+        out_dir = args.nvml_out_dir or os.path.join(os.getcwd(), 'nvml_out')
+        if rank_idx == 0:
+            os.makedirs(out_dir, exist_ok=True)
+        dist.barrier()
+
+        create_inputs()
+        for _ in range(5):
+            run_fused()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        cfg = NvmlMonitorConfig(
+            out_dir=out_dir,
+            n_iter_violation=args.nvml_iters,
+            n_iter_polled=args.nvml_poll_iters,
+            n_iter_locked=args.nvml_locked_iters,
+            poll_interval_s=max(0.0001, args.nvml_poll_interval_ms / 1000.0),
+            locked_mhz=args.nvml_lock_mhz,
+            cross_check_with_profiler=not args.nvml_no_cross_check,
+        )
+        try:
+            paths = run_nvml_monitor(
+                config=cfg,
+                rank_idx=rank_idx,
+                local_rank=local_rank,
+                is_distributed_leader=(rank_idx == 0),
+                distributed_barrier=dist.barrier,
+                run_fused=run_fused,
+                sync=torch.cuda.synchronize,
+                prof_buf=prof_buf,
+                num_sms=num_sms,
+                log=lambda m: dist_print(m, once_in_node=False),
+            )
+            dist_print(f' > rank {rank_idx}: NVML outputs: {paths}', once_in_node=False)
+        except NvmlUnavailable as _ex:
+            dist_print(f' > rank {rank_idx}: NVML monitor skipped: {_ex}',
+                       once_in_node=False)
+
+        dist.barrier()
+        buffer.destroy()
+        dist.destroy_process_group()
+        return
+
     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
@@ -417,6 +477,25 @@ if __name__ == '__main__':
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
+
+    # NVML host-side monitoring (off by default; enables the four-experiment flow)
+    parser.add_argument('--nvml-monitor', action='store_true',
+                        help='Enable NVML host-side monitoring (violation snapshots, polled clock/throttle/power, optional locked-clock compare)')
+    parser.add_argument('--nvml-out-dir', type=str, default='',
+                        help='Output directory for per-rank NVML CSV files (default: ./nvml_out)')
+    parser.add_argument('--nvml-iters', type=int, default=20,
+                        help='Iterations for the violation-snapshot loop')
+    parser.add_argument('--nvml-poll-iters', type=int, default=40,
+                        help='Iterations for the background polling window (throttle + power)')
+    parser.add_argument('--nvml-locked-iters', type=int, default=20,
+                        help='Iterations per side of the locked-clock comparison')
+    parser.add_argument('--nvml-poll-interval-ms', type=float, default=1.0,
+                        help='Target cadence of the background poller in milliseconds')
+    parser.add_argument('--nvml-lock-mhz', type=int, default=0,
+                        help='If >0, run the locked-clock comparison via `nvidia-smi -lgc {mhz},{mhz}`')
+    parser.add_argument('--nvml-no-cross-check', action='store_true',
+                        help='Disable kernel-internal MHz cross-check (pure NVML mode)')
+
     args = parser.parse_args()
 
     # Create dump trace directories

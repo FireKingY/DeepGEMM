@@ -8,7 +8,7 @@
 - **实验 A**：Power violation 增量 × kernel 频率散点图（N 次迭代）
 - **实验 B**：锁频 vs 自由运行性能对比
 - **实验 C**：后台线程轮询 throttle reason 时间序列分类
-- **实验 D**：通过 `nvmlDeviceGetSamples(TOTAL_POWER)` 硬件缓冲区获取功耗时间序列
+- **实验 D**：通过 `nvmlDeviceGetPowerUsage` 后台轮询获取功耗时间序列
 
 ## Acceptance Criteria
 
@@ -30,13 +30,13 @@
     - kernel 提前结束时，轮询线程不会挂起或死锁
     - 测量窗口关闭后，轮询线程不继续运行
 
-- AC-3: 硬件采样缓冲区的功耗时间序列
+- AC-3: 功耗时间序列（后台轮询）
   - 正向测试：
-    - `nvmlDeviceGetSamples(TOTAL_POWER)` 获取覆盖 kernel 执行窗口的硬件缓冲功耗样本
-    - 功耗样本包含与 kernel 启停对齐的时间戳（CUDA event 时间）
-    - 输出功耗值（瓦特），每 20ms kernel 时长至少 1 个样本
+    - 后台线程在 kernel 执行期间高频轮询 `nvmlDeviceGetPowerUsage`（受 NVML 驱动缓存更新周期 ~10-100ms 限制）
+    - 每个功耗样本附带 host 端时间戳（如 `time.monotonic_ns` 或与 CUDA event 对齐）
+    - 输出功耗值（瓦特）；在跨多次 kernel 调用的连续监控场景下，可在功耗时间序列中区分大 batch 与小 batch 区段
   - 反向测试：
-    - 硬件采样缓冲区为空时（kernel 太短），脚本报告"样本不足"而非失败
+    - 对于单次极短 kernel（<3ms），脚本说明可能在该 kernel 窗口内采不到样本，而非报告误导性数据
 
 - AC-4: 后台线程 SM 时钟轮询
   - 正向测试：
@@ -91,7 +91,7 @@
 ### 允许的选择
 - 可用：`pynvml`（nvidia-ml-py）做 NVML 绑定、`threading.Thread` 后台轮询、`csv` 模块输出、`matplotlib` 可选绘图、现有 `deep_gemm` Python API
 - 可用：`subprocess` 调用 `nvidia-smi -lgc` 锁频
-- 不可用：CUPTI PM Sampling（B200 上不完全可用）、`nvmlDeviceGetSamples(PROCESSOR_CLK)`（B200 不支持）
+- 不可用：CUPTI PM Sampling（B200 上不完全可用）、`nvmlDeviceGetSamples` 系列 API（本次实现统一改为 `nvmlDeviceGetPowerUsage` 后台轮询，避免硬件采样缓冲在不同驱动/硬件下的行为差异）
 
 ## Feasibility Hints and Suggestions
 
@@ -138,15 +138,12 @@ For each batch_size in [512, 1024, 8192, 32768]:
 | `nvmlDeviceGetClockInfo(SM)` | OK | 1-50 us 延迟，缓存读 |
 | `nvmlDeviceGetViolationStatus(POWER)` | OK | 累计计数器 |
 | `nvmlDeviceGetCurrentClocksThrottleReasons` | OK | 9 个 reason bit |
-| `nvmlDeviceGetPowerUsage` | OK | mW 精度 |
-| `nvmlDeviceGetSamples(TOTAL_POWER)` | OK | ~20ms 硬件采样 |
-| `nvmlDeviceGetSamples(PROCESSOR_CLK)` | **不支持** | B200 限制 |
+| `nvmlDeviceGetPowerUsage` | OK | mW 精度，作为功耗时间序列来源 |
 | `nvidia-smi -lgc` | OK | 锁频 |
 | `nvmlDeviceGetSupportedGraphicsClocks` | OK | 247 档位, 120-1965 MHz |
 
 ### 已知限制
 - NVML 是驱动缓存读，更新周期 ~10-100ms；对短 kernel（<3ms），violation 增量和前后快照比轮询更可靠
-- `PROCESSOR_CLK` 硬件采样缓冲区在 B200 上不可用
 - kernel 内 `clock64()` profiler 仍是 per-SM 频率的最精确手段（ns 精度）；NVML 提供互补的 host 侧数据
 
 ## Dependencies and Sequence
@@ -175,11 +172,11 @@ For each batch_size in [512, 1024, 8192, 32768]:
 | task1 | 创建脚本骨架：argparse、NVML 初始化、分布式设置 | AC-7, AC-8 | `coding` | - |
 | task2 | 实现前后 violation 快照（实验 A 核心） | AC-1 | `coding` | task1 |
 | task3 | 实现后台轮询线程：clock/throttle/power | AC-2, AC-4 | `coding` | task1 |
-| task4 | 实现硬件功耗采样获取（实验 D） | AC-3 | `coding` | task1 |
+| task4 | 实现后台功耗轮询（实验 D），采集 `nvmlDeviceGetPowerUsage` 时间序列 | AC-3 | `coding` | task1 |
 | task5 | 实现锁频对照（实验 B） | AC-5 | `coding` | task2 |
 | task6 | 实现所有实验的 CSV 输出 | AC-6 | `coding` | task2, task3, task4 |
 | task7 | 集成 kernel 内 profiler 交叉验证 | AC-8 | `coding` | task2 |
-| task8 | 端到端测试：在 B512 和 B32k 上运行全部实验 | AC-1 至 AC-8 | `coding` | task6, task7 |
+| task8 | Smoke-run：在 B512 和 B32k 上把全部实验流程跑通一次，验证脚本端到端可执行；统计结论由用户在 GPU 空闲后复测 | AC-1 至 AC-8 | `coding` | task6, task7 |
 
 ## Claude-Codex Deliberation
 
@@ -207,6 +204,10 @@ For each batch_size in [512, 1024, 8192, 32768]:
   - 决策状态：`约 100-500，可配置`（用户已确认）
 
 ## Implementation Notes
+
+### 执行范围
+- 当前 GPU 为共享环境（其他用户在使用），实现交付物的验证目标是：四个实验的流程在共享 GPU 上至少端到端跑通一次，脚本不崩溃、CSV 输出成功
+- AC 中"正向测试"涉及的统计性结论（如 violation 增量分布、throttle reason 时间占比、降频敏感度具体数值等）由用户在 GPU 空闲后自行复测，本次实现不在共享 GPU 上复现这些统计结果；实验 B 的实际锁频亦遵循 AC-5 反向测试约定，可在权限/共享冲突下跳过
 
 ### 代码风格要求
 - 实现代码和注释中不得包含计划特定术语，如 "AC-"、"Milestone"、"Step"、"Phase" 等工作流标记

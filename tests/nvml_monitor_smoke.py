@@ -35,6 +35,9 @@ def main():
     parser.add_argument('--iters-violation', type=int, default=10)
     parser.add_argument('--iters-polled', type=int, default=20)
     parser.add_argument('--iters-locked', type=int, default=10)
+    parser.add_argument('--batch-sizes', type=str, default='',
+                        help='Comma-separated batch sizes to sweep, mirroring '
+                             '--nvml-batch-sizes in test_mega_moe.py. Empty -> single batch.')
     args = parser.parse_args()
 
     if os.path.exists(args.out_dir):
@@ -47,51 +50,70 @@ def main():
     local_rank = 0
     torch.cuda.set_device(local_rank)
 
+    # `num_tokens` is captured by closure below, mirroring test_mega_moe.py's
+    # test() scope. Reassigning it in the sweep loop must update the closure.
+    num_tokens = 0
+
     # A no-op stand-in for the Mega MoE kernel: simulates ~200us of GPU work.
     x = torch.empty(1024 * 1024, device=f'cuda:{local_rank}')
 
     def run_fused(profiler_buf=None):
-        x.normal_()
+        # Use num_tokens via closure so the smoke run exercises the same
+        # rebinding pattern as test_mega_moe.py.
+        n = max(1, min(num_tokens, x.numel()))
+        x[:n].normal_()
         if profiler_buf is not None:
-            # The real kernel writes per-SM timing into prof_buf. The smoke run
-            # just zeroes it so the cross-check parser sees no usable rows.
             profiler_buf.zero_()
 
     num_sms = torch.cuda.get_device_properties(local_rank).multi_processor_count
     prof_buf = torch.zeros(num_sms * 10, dtype=torch.int64, device=f'cuda:{local_rank}')
 
-    cfg = NvmlMonitorConfig(
-        out_dir=args.out_dir,
-        n_iter_violation=args.iters_violation,
-        n_iter_polled=args.iters_polled,
-        n_iter_locked=args.iters_locked,
-        poll_interval_s=0.001,
-        locked_mhz=args.lock_mhz,
-        cross_check_with_profiler=True,
-    )
+    batch_sizes = [int(b.strip()) for b in args.batch_sizes.split(',') if b.strip()] \
+        if args.batch_sizes else [4096]
 
-    t0 = time.monotonic()
-    paths = run_nvml_monitor(
-        config=cfg,
-        rank_idx=0,
-        local_rank=local_rank,
-        is_distributed_leader=True,
-        distributed_barrier=lambda: None,
-        run_fused=run_fused,
-        sync=torch.cuda.synchronize,
-        prof_buf=prof_buf,
-        num_sms=num_sms,
-        log=print,
-    )
-    elapsed = time.monotonic() - t0
-    print(f'\n[smoke] driver returned in {elapsed:.2f}s')
-    print('[smoke] csv outputs:')
-    for label, path in paths.items():
-        sz = os.path.getsize(path)
-        with open(path) as f:
-            head = f.readline().rstrip()
-            data_lines = sum(1 for _ in f)
-        print(f'  {label:18s} {sz:6d} B  header={head!r}  data_rows={data_lines}  ->  {path}')
+    overall_paths = {}
+    for bs in batch_sizes:
+        num_tokens = bs  # closure rebinding mirrors the production code path
+        batch_out_dir = os.path.join(args.out_dir, f'b{bs}')
+        os.makedirs(batch_out_dir, exist_ok=True)
+
+        cfg = NvmlMonitorConfig(
+            out_dir=batch_out_dir,
+            n_iter_violation=args.iters_violation,
+            n_iter_polled=args.iters_polled,
+            n_iter_locked=args.iters_locked,
+            poll_interval_s=0.001,
+            locked_mhz=args.lock_mhz,
+            cross_check_with_profiler=True,
+        )
+
+        t0 = time.monotonic()
+        paths = run_nvml_monitor(
+            config=cfg,
+            rank_idx=0,
+            local_rank=local_rank,
+            is_distributed_leader=True,
+            distributed_barrier=lambda: None,
+            run_fused=run_fused,
+            sync=torch.cuda.synchronize,
+            prof_buf=prof_buf,
+            num_sms=num_sms,
+            log=lambda m, _bs=bs: print(f'[bs={_bs}] {m}'),
+        )
+        elapsed = time.monotonic() - t0
+        print(f'\n[smoke bs={bs}] driver returned in {elapsed:.2f}s')
+        for label, path in paths.items():
+            sz = os.path.getsize(path)
+            with open(path) as f:
+                head = f.readline().rstrip()
+                data_lines = sum(1 for _ in f)
+            print(f'  {label:18s} {sz:6d} B  header={head!r}  data_rows={data_lines}  ->  {path}')
+        overall_paths[bs] = paths
+
+    # Sanity check that each batch produced its own directory + non-empty CSVs.
+    print('\n[smoke] sweep summary:')
+    for bs, paths in overall_paths.items():
+        print(f'  b{bs}: {len(paths)} CSV(s) at {os.path.join(args.out_dir, f"b{bs}")}')
 
 
 if __name__ == '__main__':

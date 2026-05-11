@@ -168,43 +168,72 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             dist.destroy_process_group()
             return
 
+        # Parse the batch-size sweep. Empty -> behave like a single-batch run at
+        # the current num_max_tokens_per_rank.
+        if args.nvml_batch_sizes.strip():
+            sweep_batch_sizes = [int(b.strip()) for b in args.nvml_batch_sizes.split(',') if b.strip()]
+        else:
+            sweep_batch_sizes = [num_max_tokens_per_rank]
+
+        too_big = [b for b in sweep_batch_sizes if b > num_max_tokens_per_rank]
+        if too_big:
+            dist_print(
+                f'--nvml-batch-sizes contains {too_big} which exceed '
+                f'--num-max-tokens-per-rank ({num_max_tokens_per_rank}); the symmetric '
+                'buffer is sized for the latter, so raise --num-max-tokens-per-rank to '
+                f'the largest entry in the sweep ({max(sweep_batch_sizes)}).',
+                once_in_node=True)
+            dist.barrier()
+            buffer.destroy()
+            dist.destroy_process_group()
+            return
+
         out_dir = args.nvml_out_dir or os.path.join(os.getcwd(), 'nvml_out')
         if rank_idx == 0:
             os.makedirs(out_dir, exist_ok=True)
         dist.barrier()
 
-        create_inputs()
-        for _ in range(5):
-            run_fused()
-        torch.cuda.synchronize()
-        dist.barrier()
+        for bs in sweep_batch_sizes:
+            # Reassign the closure-captured num_tokens so create_inputs() and
+            # run_fused() see the new token count without restructuring.
+            num_tokens = bs
+            batch_out_dir = os.path.join(out_dir, f'b{bs}')
+            if rank_idx == 0:
+                os.makedirs(batch_out_dir, exist_ok=True)
+            dist.barrier()
 
-        cfg = NvmlMonitorConfig(
-            out_dir=out_dir,
-            n_iter_violation=args.nvml_iters,
-            n_iter_polled=args.nvml_poll_iters,
-            n_iter_locked=args.nvml_locked_iters,
-            poll_interval_s=max(0.0001, args.nvml_poll_interval_ms / 1000.0),
-            locked_mhz=args.nvml_lock_mhz,
-            cross_check_with_profiler=not args.nvml_no_cross_check,
-        )
-        try:
-            paths = run_nvml_monitor(
-                config=cfg,
-                rank_idx=rank_idx,
-                local_rank=local_rank,
-                is_distributed_leader=(rank_idx == 0),
-                distributed_barrier=dist.barrier,
-                run_fused=run_fused,
-                sync=torch.cuda.synchronize,
-                prof_buf=prof_buf,
-                num_sms=num_sms,
-                log=lambda m: dist_print(m, once_in_node=False),
+            create_inputs()
+            for _ in range(5):
+                run_fused()
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            cfg = NvmlMonitorConfig(
+                out_dir=batch_out_dir,
+                n_iter_violation=args.nvml_iters,
+                n_iter_polled=args.nvml_poll_iters,
+                n_iter_locked=args.nvml_locked_iters,
+                poll_interval_s=max(0.0001, args.nvml_poll_interval_ms / 1000.0),
+                locked_mhz=args.nvml_lock_mhz,
+                cross_check_with_profiler=not args.nvml_no_cross_check,
             )
-            dist_print(f' > rank {rank_idx}: NVML outputs: {paths}', once_in_node=False)
-        except NvmlUnavailable as _ex:
-            dist_print(f' > rank {rank_idx}: NVML monitor skipped: {_ex}',
-                       once_in_node=False)
+            try:
+                paths = run_nvml_monitor(
+                    config=cfg,
+                    rank_idx=rank_idx,
+                    local_rank=local_rank,
+                    is_distributed_leader=(rank_idx == 0),
+                    distributed_barrier=dist.barrier,
+                    run_fused=run_fused,
+                    sync=torch.cuda.synchronize,
+                    prof_buf=prof_buf,
+                    num_sms=num_sms,
+                    log=lambda m, _bs=bs: dist_print(f'[bs={_bs}] {m}', once_in_node=False),
+                )
+                dist_print(f' > rank {rank_idx} bs={bs}: NVML outputs: {paths}', once_in_node=False)
+            except NvmlUnavailable as _ex:
+                dist_print(f' > rank {rank_idx} bs={bs}: NVML monitor skipped: {_ex}',
+                           once_in_node=False)
 
         dist.barrier()
         buffer.destroy()
@@ -483,6 +512,10 @@ if __name__ == '__main__':
                         help='Enable NVML host-side monitoring (violation snapshots, polled clock/throttle/power, optional locked-clock compare)')
     parser.add_argument('--nvml-out-dir', type=str, default='',
                         help='Output directory for per-rank NVML CSV files (default: ./nvml_out)')
+    parser.add_argument('--nvml-batch-sizes', type=str, default='',
+                        help='Comma-separated token counts to sweep for NVML monitoring '
+                             '(e.g. "512,8192,32768"). Each value must be <= --num-max-tokens-per-rank. '
+                             'When empty, the sweep collapses to a single batch at --num-max-tokens-per-rank.')
     parser.add_argument('--nvml-iters', type=int, default=20,
                         help='Iterations for the violation-snapshot loop')
     parser.add_argument('--nvml-poll-iters', type=int, default=40,

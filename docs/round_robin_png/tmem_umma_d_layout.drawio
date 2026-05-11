@@ -1,0 +1,115 @@
+<mxfile host="Electron" modified="2026-04-22T00:00:00.000Z" agent="generator" version="24.0.0">
+  <diagram id="tmem-umma-d" name="TMEM UMMA D layout">
+    <mxGraphModel dx="2000" dy="1300" grid="1" gridSize="10" guides="1" tooltips="1"
+                  connect="1" arrows="1" fold="1" page="1" pageScale="1"
+                  pageWidth="1800" pageHeight="1150" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="c2" value="① UMMA 输出 D tile: 256 × 192 FP32 (UMMA_M × UMMA_N)" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontColor=#222;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="40" y="10" width="1200" height="30" as="geometry"/></mxCell>
+<mxCell id="c3" value="UMMA D rows 0..127" style="rounded=1;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;fillColor=#FFCDD2;strokeColor=#B71C1C;fontSize=14;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="80" y="60" width="500" height="70.0" as="geometry"/></mxCell>
+<mxCell id="c4" value="UMMA D rows 128..255" style="rounded=1;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;fillColor=#FFE0B2;strokeColor=#B71C1C;fontSize=14;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="80" y="130.0" width="500" height="70.0" as="geometry"/></mxCell>
+<mxCell id="c5" value="UMMA_M = 256 (swap AB: 我们的 N = 输出 channel)" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#6A1B9A;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="20" y="26" width="180" height="28" as="geometry"/></mxCell>
+<mxCell id="c6" value="← UMMA_N = 192 (swap AB: 我们的 M = token 数 = BLOCK_M) →" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="80" y="206" width="500" height="22" as="geometry"/></mxCell>
+<mxCell id="c7" value="→ Leader CTA" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=13;fontColor=#B71C1C;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="600" y="83.0" width="150" height="24" as="geometry"/></mxCell>
+<mxCell id="c8" value="→ Peer CTA" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=13;fontColor=#B71C1C;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="600" y="153.0" width="150" height="24" as="geometry"/></mxCell>
+<mxCell id="c9" value="tcgen05.mma.cta_group::2 的规则:
+
+ • UMMA_M 轴按一半分给 leader 与 peer
+ • 每个 CTA 的 TMEM 有 128 个物理 lane,
+   刚好装 UMMA_M / 2 = 128 行
+ • Leader 负责 D[0..128, :], Peer 负责 D[128..256, :]" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#FFFDE7;strokeColor=#F9A825;fontSize=11;" vertex="1" parent="1"><mxGeometry x="780" y="60" width="420" height="140" as="geometry"/></mxCell>
+<mxCell id="c10" value="② 两个 CTA 的 TMEM (只画 accum slot 0, 128 lane × 192 col FP32)" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontColor=#222;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="40" y="250" width="1200" height="30" as="geometry"/></mxCell>
+<mxCell id="c11" value="" style="rounded=1;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;fillColor=#C8E6C9;strokeColor=#333333;fontSize=12;" vertex="1" parent="1"><mxGeometry x="180" y="290" width="800" height="140" as="geometry"/></mxCell>
+<mxCell id="c12" value="" style="rounded=1;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;fillColor=#C8E6C9;strokeColor=#333333;fontSize=12;" vertex="1" parent="1"><mxGeometry x="180" y="480" width="800" height="140" as="geometry"/></mxCell>
+<mxCell id="c13" value="Leader CTA" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=14;fontColor=#1565C0;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="20" y="348.0" width="150" height="24" as="geometry"/></mxCell>
+<mxCell id="c14" value="Peer CTA" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=14;fontColor=#AD1457;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="20" y="538.0" width="150" height="24" as="geometry"/></mxCell>
+<mxCell id="c15" value="Leader CTA TMEM accum slot 0  (128 lane × 192 col FP32)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;" vertex="1" parent="1"><mxGeometry x="180" y="268" width="800" height="22" as="geometry"/></mxCell>
+<mxCell id="c16" value="Peer CTA TMEM accum slot 0  (128 lane × 192 col FP32)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#AD1457;" vertex="1" parent="1"><mxGeometry x="180" y="458" width="800" height="22" as="geometry"/></mxCell>
+<mxCell id="c17" value="→ col 方向 = token 方向 (UMMA_N = BLOCK_M)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=12;fontColor=#1565C0;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="180" y="670" width="800" height="22" as="geometry"/></mxCell>
+<mxCell id="c18" value="↓ lane 方向
+= output channel
+(swap AB 后)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#6A1B9A;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="20" y="460" width="150" height="90" as="geometry"/></mxCell>
+<mxCell id="c19" value="lane 0" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#555;" vertex="1" parent="1"><mxGeometry x="120" y="282" width="54" height="16" as="geometry"/></mxCell>
+<mxCell id="c20" value="lane 127" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#555;" vertex="1" parent="1"><mxGeometry x="120" y="422" width="54" height="16" as="geometry"/></mxCell>
+<mxCell id="c21" value="lane 0" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#555;" vertex="1" parent="1"><mxGeometry x="120" y="472" width="54" height="16" as="geometry"/></mxCell>
+<mxCell id="c22" value="lane 127" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#555;" vertex="1" parent="1"><mxGeometry x="120" y="612" width="54" height="16" as="geometry"/></mxCell>
+<mxCell id="c23" value="col 0" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#555;" vertex="1" parent="1"><mxGeometry x="160" y="624" width="40" height="16" as="geometry"/></mxCell>
+<mxCell id="c24" value="col 48" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#555;" vertex="1" parent="1"><mxGeometry x="360.0" y="624" width="40" height="16" as="geometry"/></mxCell>
+<mxCell id="c25" value="col 96" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#555;" vertex="1" parent="1"><mxGeometry x="560.0" y="624" width="40" height="16" as="geometry"/></mxCell>
+<mxCell id="c26" value="col 144" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#555;" vertex="1" parent="1"><mxGeometry x="760.0" y="624" width="40" height="16" as="geometry"/></mxCell>
+<mxCell id="c27" value="col 191" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#555;" vertex="1" parent="1"><mxGeometry x="960" y="624" width="40" height="16" as="geometry"/></mxCell>
+<mxCell id="c28" value="" style="rounded=1;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;fillColor=#FFB74D;strokeColor=#E65100;fontSize=12;" vertex="1" parent="1"><mxGeometry x="346.6666666666667" y="290" width="33.33333333333333" height="140" as="geometry"/></mxCell>
+<mxCell id="c29" value="" style="rounded=1;whiteSpace=wrap;html=1;align=center;verticalAlign=middle;fillColor=#FFB74D;strokeColor=#E65100;fontSize=12;" vertex="1" parent="1"><mxGeometry x="346.6666666666667" y="480" width="33.33333333333333" height="140" as="geometry"/></mxCell>
+<mxCell id="c30" value="一个 atom (j=5):
+tmem_addr = 0·UMMA_N + WG·96 + 5·8 = 40  (col)
+覆盖 128 lane × 8 col = 128 channel × 8 token" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#FFF8E1;strokeColor=#E65100;fontSize=11;" vertex="1" parent="1"><mxGeometry x="400.0" y="240" width="340" height="90" as="geometry"/></mxCell>
+<mxCell id="c31" value="UMMA D row R  (R ∈ [0, 128))
+→ leader lane L = R" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#FFFFFF;strokeColor=#C62828;fontSize=11;" vertex="1" parent="1"><mxGeometry x="1000" y="300" width="310" height="50" as="geometry"/></mxCell>
+<mxCell id="c32" value="UMMA D row R  (R ∈ [128, 256))
+→ peer lane L = R - 128" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#FFFFFF;strokeColor=#C62828;fontSize=11;" vertex="1" parent="1"><mxGeometry x="1000" y="490" width="310" height="50" as="geometry"/></mxCell>
+<mxCell id="c33" style="edgeStyle=none;endArrow=classic;html=1;strokeColor=#1976D2;strokeWidth=3;" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="180" y="440" as="sourcePoint"/><mxPoint x="580.0" y="440" as="targetPoint"/></mxGeometry></mxCell>
+<mxCell id="c34" style="edgeStyle=none;endArrow=classic;html=1;strokeColor=#E53935;strokeWidth=3;" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="580.0" y="440" as="sourcePoint"/><mxPoint x="980" y="440" as="targetPoint"/></mxGeometry></mxCell>
+<mxCell id="c35" value="Epilogue WG0: 沿 col 顺序扫 96 token (= 12 atoms × 8 tok)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#1976D2;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="180" y="444" width="400.0" height="22" as="geometry"/></mxCell>
+<mxCell id="c36" value="Epilogue WG1: 沿 col 顺序扫 96 token (= 12 atoms × 8 tok)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#E53935;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="580.0" y="444" width="400.0" height="22" as="geometry"/></mxCell>
+<mxCell id="c37" value="③ Zoom — 一个 atom 内部: 128 lane × 8 col, 被 epilogue 4 warps × 2 次 TMEM_LOAD 覆盖" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=16;fontColor=#222;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="40" y="690" width="1400" height="30" as="geometry"/></mxCell>
+<mxCell id="c38" value="" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#81C784;strokeColor=#2E7D32;fontSize=10;" vertex="1" parent="1"><mxGeometry x="320" y="720.0" width="640" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c39" value="warp 0  lane [0, 16)
+第 1 条 TMEM_LOAD (tmem_addr)" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#333;" vertex="1" parent="1"><mxGeometry x="20" y="720.0" width="290" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c40" value="" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#A5D6A7;strokeColor=#558B2F;fontSize=10;" vertex="1" parent="1"><mxGeometry x="320" y="760.0" width="640" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c41" value="warp 0  lane [16, 32)
+第 2 条 TMEM_LOAD (tmem_addr | 0x00100000)" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#333;" vertex="1" parent="1"><mxGeometry x="20" y="760.0" width="290" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c42" value="" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#FFB74D;strokeColor=#E65100;fontSize=10;" vertex="1" parent="1"><mxGeometry x="320" y="800.0" width="640" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c43" value="warp 1  lane [32, 48)
+第 1 条 TMEM_LOAD (tmem_addr)" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#333;" vertex="1" parent="1"><mxGeometry x="20" y="800.0" width="290" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c44" value="" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#FFCC80;strokeColor=#EF6C00;fontSize=10;" vertex="1" parent="1"><mxGeometry x="320" y="840.0" width="640" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c45" value="warp 1  lane [48, 64)
+第 2 条 TMEM_LOAD (tmem_addr | 0x00100000)" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#333;" vertex="1" parent="1"><mxGeometry x="20" y="840.0" width="290" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c46" value="" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#BA68C8;strokeColor=#6A1B9A;fontSize=10;" vertex="1" parent="1"><mxGeometry x="320" y="880.0" width="640" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c47" value="warp 2  lane [64, 80)
+第 1 条 TMEM_LOAD (tmem_addr)" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#333;" vertex="1" parent="1"><mxGeometry x="20" y="880.0" width="290" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c48" value="" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#CE93D8;strokeColor=#7B1FA2;fontSize=10;" vertex="1" parent="1"><mxGeometry x="320" y="920.0" width="640" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c49" value="warp 2  lane [80, 96)
+第 2 条 TMEM_LOAD (tmem_addr | 0x00100000)" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#333;" vertex="1" parent="1"><mxGeometry x="20" y="920.0" width="290" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c50" value="" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#4FC3F7;strokeColor=#0277BD;fontSize=10;" vertex="1" parent="1"><mxGeometry x="320" y="960.0" width="640" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c51" value="warp 3  lane [96, 112)
+第 1 条 TMEM_LOAD (tmem_addr)" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#333;" vertex="1" parent="1"><mxGeometry x="20" y="960.0" width="290" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c52" value="" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#81D4FA;strokeColor=#0288D1;fontSize=10;" vertex="1" parent="1"><mxGeometry x="320" y="1000.0" width="640" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c53" value="warp 3  lane [112, 128)
+第 2 条 TMEM_LOAD (tmem_addr | 0x00100000)" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#333;" vertex="1" parent="1"><mxGeometry x="20" y="1000.0" width="290" height="40.0" as="geometry"/></mxCell>
+<mxCell id="c54" value="tok0" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;" vertex="1" parent="1"><mxGeometry x="340.0" y="698" width="40" height="20" as="geometry"/></mxCell>
+<mxCell id="c55" value="tok1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;" vertex="1" parent="1"><mxGeometry x="420.0" y="698" width="40" height="20" as="geometry"/></mxCell>
+<mxCell id="c56" value="tok2" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;" vertex="1" parent="1"><mxGeometry x="500.0" y="698" width="40" height="20" as="geometry"/></mxCell>
+<mxCell id="c57" value="tok3" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;" vertex="1" parent="1"><mxGeometry x="580.0" y="698" width="40" height="20" as="geometry"/></mxCell>
+<mxCell id="c58" value="tok4" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;" vertex="1" parent="1"><mxGeometry x="660.0" y="698" width="40" height="20" as="geometry"/></mxCell>
+<mxCell id="c59" value="tok5" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;" vertex="1" parent="1"><mxGeometry x="740.0" y="698" width="40" height="20" as="geometry"/></mxCell>
+<mxCell id="c60" value="tok6" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;" vertex="1" parent="1"><mxGeometry x="820.0" y="698" width="40" height="20" as="geometry"/></mxCell>
+<mxCell id="c61" value="tok7" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;" vertex="1" parent="1"><mxGeometry x="900.0" y="698" width="40" height="20" as="geometry"/></mxCell>
+<mxCell id="c62" style="edgeStyle=none;endArrow=classic;html=1;strokeColor=#1565C0;strokeWidth=2;" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="320" y="690" as="sourcePoint"/><mxPoint x="960" y="690" as="targetPoint"/></mxGeometry></mxCell>
+<mxCell id="c63" value="→ col = token" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#1565C0;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="970" y="680" width="140" height="20" as="geometry"/></mxCell>
+<mxCell id="c64" style="edgeStyle=none;endArrow=classic;html=1;strokeColor=#6A1B9A;strokeWidth=2;" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="300" y="720" as="sourcePoint"/><mxPoint x="300" y="1040" as="targetPoint"/></mxGeometry></mxCell>
+<mxCell id="c65" value="↓ lane
+= channel" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=10;fontColor=#6A1B9A;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="240" y="864.0" width="60" height="32" as="geometry"/></mxCell>
+<mxCell id="c66" value="为什么 swap AB 让这个布局「天然匹配」 epilogue 遍历:
+
+① TMEM_LOAD_16dp256b1x 一次读 16 lane × 8 FP32:
+    沿 lane 方向并行, 沿 col 方向连续
+
+② swap AB 让 col = token 方向, 所以
+    &quot;逐 token 做 SwiGLU/量化/STSM&quot;
+    就是 col 递增扫描 → tmem_addr += ATOM_M
+
+③ 2 个 WG 分 192 col 各一半:
+    WG0: col [0, 96)    WG1: col [96, 192)
+    每 WG 分 12 个 atom, 每 atom = 8 token
+
+④ lane 方向是 channel, 经过 gate/up interleave 后
+    gate 和 up 在相邻 lane → 一条 TMEM_LOAD
+    就抓出一对 gate/up
+
+→ 最终 TMEM 读回的 register 布局可以
+  直接做 SwiGLU/STSM, 无需 shuffle/transpose" style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#E3F2FD;strokeColor=#1976D2;fontSize=11;" vertex="1" parent="1"><mxGeometry x="990" y="680" width="520" height="390" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

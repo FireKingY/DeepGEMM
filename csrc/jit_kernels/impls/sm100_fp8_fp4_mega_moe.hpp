@@ -30,6 +30,7 @@ public:
         // Runtime arguments
         void* y;
         int* cumulative_local_expert_recv_stats;
+        uint64_t* profiler_buffer;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
@@ -69,6 +70,8 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
+        {},
         {}
     >);
 }};
@@ -85,7 +88,9 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.config.enable_pull ? "true" : "false",
+    args.config.enable_combine ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -103,7 +108,8 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.tensor_map_l2_weights_sf
+            args.tensor_map_l2_weights_sf,
+            args.profiler_buffer
         ));
     }
 };
@@ -115,22 +121,27 @@ static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
     const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
+    const std::optional<torch::Tensor> profiler_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& enable_pull,
+    const bool& enable_combine
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
 
     // Heuristics
-    const auto config = get_mega_moe_config(
+    auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden, num_padded_sf_pool_tokens);
+    config.enable_pull = enable_pull;
+    config.enable_combine = enable_combine;
 
     // Make tensormap
     constexpr int kGranK = 32;
@@ -184,6 +195,10 @@ static void sm100_fp8_fp4_mega_moe(
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
+    uint64_t* profiler_buffer_ptr = nullptr;
+    if (profiler_buffer.has_value())
+        profiler_buffer_ptr = reinterpret_cast<uint64_t*>(profiler_buffer->data_ptr());
+
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
     const SM100FP8FP4MegaMoERuntime::Args args = {
@@ -196,6 +211,7 @@ static void sm100_fp8_fp4_mega_moe(
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+        .profiler_buffer = profiler_buffer_ptr,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,

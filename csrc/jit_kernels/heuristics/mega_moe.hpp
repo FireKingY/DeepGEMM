@@ -37,6 +37,9 @@ struct MegaMoEConfig {
     // Thread layout
     int num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads;
 
+    // NVLink traffic switches (for profiling/ablation)
+    bool enable_pull = true, enable_combine = true;
+
     friend std::ostream& operator << (std::ostream& os, const MegaMoEConfig& config) {
         os << "MegaMoEConfig("
            << "block_m=" << config.block_m << ", block_n=" << config.block_n << ", block_k=" << config.block_k
@@ -168,7 +171,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Fixed total
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers + smem_tmem_ptr;
 
-    // Select maximum num_stages
+    // Select maximum num_stages.
     const int num_stages = (smem_capacity - smem_fixed) / smem_per_stage;
     DG_HOST_ASSERT(num_stages >= 2);
 

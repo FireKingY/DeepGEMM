@@ -135,6 +135,7 @@ static void fp8_fp4_mega_moe(
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const std::optional<torch::Tensor>& profiler_buffer,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
     const int& num_max_tokens_per_rank,
@@ -142,7 +143,9 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& enable_pull,
+    const bool& enable_combine
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -208,12 +211,14 @@ static void fp8_fp4_mega_moe(
                                l1_weights, l2_weights,
                                l1_weights_sf, l2_weights_sf,
                                cumulative_local_expert_recv_stats,
+                               profiler_buffer,
                                sym_buffer_ptrs,
                                rank_idx, num_max_tokens_per_rank,
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, fast_math,
+                               enable_pull, enable_combine);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

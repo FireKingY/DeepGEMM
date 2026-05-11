@@ -100,9 +100,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l2_weights = cast_grouped_weights_to_fp4(l2_weights)
         transformed_l1_weights, transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
 
+    # Profiler buffer layout (all uint64):
+    #   [0 .. kNumSMs*4)          kernel span: [clk_s, gt_s, clk_e, gt_e] per SM
+    #   [kNumSMs*4 .. kNumSMs*8)  compute span: [clk_s, gt_s, clk_e, gt_e] per SM (leader CTA only)
+    #   [kNumSMs*8 .. kNumSMs*10) block counts: [n_l1, n_l2] per SM
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    prof_buf = torch.zeros(num_sms * 10, dtype=torch.int64, device='cuda')
+
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
-    def run_fused():
+    def run_fused(profiler_buf=None):
         buffer.x[:num_tokens].copy_(x[0])
         buffer.x_sf[:num_tokens].copy_(x[1])
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
@@ -115,8 +122,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             transformed_l1_weights, transformed_l2_weights,
             buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
+            profiler_buffer=profiler_buf,
             activation_clamp=args.activation_clamp,
-            fast_math=bool(args.fast_math)
+            fast_math=bool(args.fast_math),
+            enable_pull=bool(args.enable_pull),
+            enable_combine=bool(args.enable_combine)
         )
         return y, cumulative_local_expert_recv_stats_fused
 
@@ -207,11 +217,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                       (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
 
-    # Benchmark
-    t_fused = bench_kineto(
-        run_fused, 'mega_moe',
+    # Benchmark — optionally run multiple times and trim worst 20% (env: DG_NUM_BENCH_RUNS)
+    _num_bench_runs = int(os.environ.get('DG_NUM_BENCH_RUNS', '1'))
+    _bench_args = dict(
+        kernel_names='mega_moe',
         barrier=lambda: ep_buffer.barrier(use_comm_stream=False) if ep_buffer else dist.barrier(),
         trace_path=None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json')
+    _samples = sorted(bench_kineto(run_fused, **_bench_args) for _ in range(_num_bench_runs))
+    if int(os.environ.get('DG_BENCH_BEST', '0')):
+        t_fused = _samples[0]
+    else:
+        _n_keep = max(1, len(_samples) - int(round(len(_samples) * 0.2)))
+        t_fused = sum(_samples[:_n_keep]) / _n_keep
     t_baseline = tilelang_bench(run_baseline, _n_warmup=5, _n_repeat=1, backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
 
     # TFLOPS: 3 matmuls (L1 left, L1 right, L2), each 2 * M * N * K
@@ -250,6 +267,124 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                f'reduction: {t_reduction * 1e6:4.1f} us | '
                f'{safe_div(t_baseline, t_fused):.2f}x legacy')
 
+    # Per-SM profiling: timing + block counts + TFLOPS
+    import numpy as np, statistics
+
+    # Replicate BLOCK_M heuristic from heuristics/mega_moe.hpp
+    expected_tpe = float(num_tokens) * num_ranks * num_topk / num_experts
+    if expected_tpe <= 8.5:
+        block_m = 16
+    elif expected_tpe <= 16.5:
+        block_m = 32
+    elif expected_tpe <= 32.5:
+        block_m = 64
+    elif expected_tpe <= 64.5:
+        block_m = 96
+    elif expected_tpe <= 96.5:
+        block_m = 128
+    else:
+        block_m = 192
+
+    BLOCK_N = 128
+    L1_SHAPE_K = hidden
+    L2_SHAPE_K = intermediate_hidden
+    flops_per_l1_block = 2 * block_m * BLOCK_N * L1_SHAPE_K
+    flops_per_l2_block = 2 * block_m * BLOCK_N * L2_SHAPE_K
+    PEAK_OPS_PER_CYCLE_PER_SM = 16384  # mxf8f6f4 UMMA on B200
+
+    n_prof_samples = 5
+    for sample_i in range(n_prof_samples):
+        prof_buf.zero_()
+        run_fused(profiler_buf=prof_buf)
+        torch.cuda.synchronize()
+        raw = prof_buf.cpu().numpy().view(np.uint64)
+
+        kern_timing = raw[:num_sms * 4].reshape(num_sms, 4)          # kernel span
+        comp_timing = raw[num_sms * 4:num_sms * 8].reshape(num_sms, 4)  # compute span
+        blocks = raw[num_sms * 8:num_sms * 10].reshape(num_sms, 2)   # block counts
+
+        per_sm_mhz, per_sm_wall_us, per_sm_tflops, per_sm_n_l1, per_sm_n_l2 = [], [], [], [], []
+        valid_gt_start, valid_gt_end = [], []
+        total_flops = 0
+
+        # Compute span (narrower: dispatch-barrier to MMA-end, leader CTA only)
+        comp_per_sm_mhz, comp_per_sm_wall_us, comp_per_sm_tflops = [], [], []
+        comp_gt_start, comp_gt_end = [], []
+        comp_total_flops = 0
+
+        for sm in range(num_sms):
+            nl1, nl2 = int(blocks[sm, 0]), int(blocks[sm, 1])
+            per_sm_n_l1.append(nl1)
+            per_sm_n_l2.append(nl2)
+            sm_flops = nl1 * flops_per_l1_block + nl2 * flops_per_l2_block
+
+            # Kernel span
+            cs, gs, ce, ge = int(kern_timing[sm, 0]), int(kern_timing[sm, 1]), int(kern_timing[sm, 2]), int(kern_timing[sm, 3])
+            if ce > cs and ge > gs:
+                mhz = (ce - cs) * 1000.0 / (ge - gs)
+                wall_us = (ge - gs) / 1000.0
+                sm_tflops = sm_flops / ((ge - gs) * 1e-9) / 1e12 if (ge - gs) > 0 else 0.0
+                per_sm_mhz.append(mhz)
+                per_sm_wall_us.append(wall_us)
+                per_sm_tflops.append(sm_tflops)
+                valid_gt_start.append(gs)
+                valid_gt_end.append(ge)
+                total_flops += sm_flops
+
+            # Compute span (only leader CTA writes these, so half the SMs will be zero)
+            ccs, cgs, cce, cge = int(comp_timing[sm, 0]), int(comp_timing[sm, 1]), int(comp_timing[sm, 2]), int(comp_timing[sm, 3])
+            if cce > ccs and cge > cgs:
+                c_mhz = (cce - ccs) * 1000.0 / (cge - cgs)
+                c_wall_us = (cge - cgs) / 1000.0
+                c_sm_tflops = sm_flops / ((cge - cgs) * 1e-9) / 1e12 if (cge - cgs) > 0 else 0.0
+                comp_per_sm_mhz.append(c_mhz)
+                comp_per_sm_wall_us.append(c_wall_us)
+                comp_per_sm_tflops.append(c_sm_tflops)
+                comp_gt_start.append(cgs)
+                comp_gt_end.append(cge)
+                comp_total_flops += sm_flops
+
+        if not per_sm_mhz:
+            continue
+
+        overall_wall_ns = max(valid_gt_end) - min(valid_gt_start)
+        overall_tflops = total_flops / (overall_wall_ns * 1e-9) / 1e12 if overall_wall_ns > 0 else 0.0
+        med_mhz = statistics.median(per_sm_mhz)
+        peak_tflops_per_sm = PEAK_OPS_PER_CYCLE_PER_SM * med_mhz * 1e6 / 1e12
+        overall_peak_tflops = peak_tflops_per_sm * num_sms
+
+        med_sm_util = statistics.median(per_sm_tflops) / peak_tflops_per_sm * 100 if peak_tflops_per_sm > 0 else 0.0
+        overall_util = overall_tflops / overall_peak_tflops * 100 if overall_peak_tflops > 0 else 0.0
+
+        if sample_i == 0:
+            dist_print(f' > EP: {rank_idx:2}/{num_ranks} | BLOCK_M={block_m}  num_sms={num_sms}  '
+                       f'flops/l1_blk={flops_per_l1_block/1e6:.1f}M  flops/l2_blk={flops_per_l2_block/1e6:.1f}M  '
+                       f'total_flops={total_flops/1e9:.1f}G',
+                       once_in_node=True)
+        dist_print(f' > EP: {rank_idx:2}/{num_ranks} | sample {sample_i} | '
+                   f'KERNEL MHz: med={med_mhz:.0f} min={min(per_sm_mhz):.0f} max={max(per_sm_mhz):.0f} | '
+                   f'wall_us: med={statistics.median(per_sm_wall_us):.0f} min={min(per_sm_wall_us):.0f} max={max(per_sm_wall_us):.0f} | '
+                   f'per-SM TFLOPS: med={statistics.median(per_sm_tflops):.2f} min={min(per_sm_tflops):.2f} max={max(per_sm_tflops):.2f} '
+                   f'(peak@med_clk={peak_tflops_per_sm:.1f} util={med_sm_util:.1f}%) | '
+                   f'overall={overall_tflops:.0f}/{overall_peak_tflops:.0f} TFLOPS ({overall_util:.1f}%) (gt_span={overall_wall_ns/1e3:.0f}us) | '
+                   f'L1_blks: {sum(per_sm_n_l1)} (min={min(per_sm_n_l1)} max={max(per_sm_n_l1)}) '
+                   f'L2_blks: {sum(per_sm_n_l2)} (min={min(per_sm_n_l2)} max={max(per_sm_n_l2)})')
+        if comp_per_sm_mhz:
+            comp_overall_wall_ns = max(comp_gt_end) - min(comp_gt_start)
+            comp_overall_tflops = total_flops / (comp_overall_wall_ns * 1e-9) / 1e12 if comp_overall_wall_ns > 0 else 0.0
+            comp_med_mhz = statistics.median(comp_per_sm_mhz)
+            comp_peak = PEAK_OPS_PER_CYCLE_PER_SM * comp_med_mhz * 1e6 / 1e12
+            comp_overall_peak = comp_peak * num_sms
+            comp_med_util = statistics.median(comp_per_sm_tflops) / comp_peak * 100 if comp_peak > 0 else 0.0
+            comp_overall_util = comp_overall_tflops / comp_overall_peak * 100 if comp_overall_peak > 0 else 0.0
+            dist_print(f' > EP: {rank_idx:2}/{num_ranks} | sample {sample_i} | '
+                       f'COMPUTE MHz: med={comp_med_mhz:.0f} min={min(comp_per_sm_mhz):.0f} max={max(comp_per_sm_mhz):.0f} | '
+                       f'wall_us: med={statistics.median(comp_per_sm_wall_us):.0f} min={min(comp_per_sm_wall_us):.0f} max={max(comp_per_sm_wall_us):.0f} | '
+                       f'per-SM TFLOPS: med={statistics.median(comp_per_sm_tflops):.2f} min={min(comp_per_sm_tflops):.2f} max={max(comp_per_sm_tflops):.2f} '
+                       f'(peak@med_clk={comp_peak:.1f} util={comp_med_util:.1f}%) | '
+                       f'overall={comp_overall_tflops:.0f}/{comp_overall_peak:.0f} TFLOPS ({comp_overall_util:.1f}%) (gt_span={comp_overall_wall_ns/1e3:.0f}us) | '
+                       f'n_leader_sms={len(comp_per_sm_mhz)}')
+
     # Exit
     dist.barrier()
     buffer.destroy()
@@ -275,6 +410,8 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
+    parser.add_argument('--enable-pull', type=int, default=1, help='Enable NVLink pull (0=off, 1=on)')
+    parser.add_argument('--enable-combine', type=int, default=1, help='Enable NVLink combine push (0=off, 1=on)')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

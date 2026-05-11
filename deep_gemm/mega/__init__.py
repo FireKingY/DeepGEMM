@@ -110,19 +110,24 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
                      sym_buffer: SymmBuffer,
                      cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                     profiler_buffer: Optional[torch.Tensor] = None,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
-                     fast_math: bool = True):
+                     fast_math: bool = True,
+                     enable_pull: bool = True,
+                     enable_combine: bool = True):
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,
+        profiler_buffer,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        enable_pull, enable_combine
     )

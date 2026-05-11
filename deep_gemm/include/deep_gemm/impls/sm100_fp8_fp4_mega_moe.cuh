@@ -34,6 +34,8 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kEnablePull = true,
+    bool kEnableCombine = true,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -59,7 +61,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf) {
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
+                            uint64_t* profiler_buffer) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -269,6 +272,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     auto combine_barriers       = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + i); });
     auto tmem_ptr_in_smem       = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + kNumEpilogueWarps * 2);
 
+    // Per-SM profiler layout:
+    //   [0..kNumSMs*4)        kernel span: [start_clk, start_gt, end_clk, end_gt] per SM
+    //   [kNumSMs*4..kNumSMs*8) compute span: [start_clk, start_gt, end_clk, end_gt] per SM
+    //   [kNumSMs*8..kNumSMs*10) block counts: [n_l1, n_l2] per SM
+    auto read_globaltimer_ns = []() {
+        uint64_t ns;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ns));
+        return ns;
+    };
+    if (warp_idx == 0 and lane_idx == 0 and profiler_buffer != nullptr) {
+        profiler_buffer[sm_idx * 4 + 0] = static_cast<uint64_t>(clock64());
+        profiler_buffer[sm_idx * 4 + 1] = read_globaltimer_ns();
+    }
+
     // A cluster sync is essential for 2CTA tensor memory allocation
     comm::cluster_sync_with_relaxed_arrive();
 
@@ -438,6 +455,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* After the NVLink barrier, there is a grid sync */ true
         );
 
+        // Compute span start: after first nvlink barrier, before pull begins
+        if (warp_idx == 0 and lane_idx == 0 and profiler_buffer != nullptr) {
+            profiler_buffer[kNumSMs * 4 + sm_idx * 4 + 0] = static_cast<uint64_t>(clock64());
+            profiler_buffer[kNumSMs * 4 + sm_idx * 4 + 1] = read_globaltimer_ns();
+        }
+
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
@@ -544,44 +567,41 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
-            // TMA load token from remote rank into shared memory
-            if (cute::elect_one_sync()) {
-                ptx::tma_load_1d(
-                    pull_buffer.get_base_ptr(),
-                    sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
-                                   current_rank_in_expert_idx),
-                    pull_mbarrier, kHidden);
+            if constexpr (kEnablePull) {
+                if (cute::elect_one_sync()) {
+                    ptx::tma_load_1d(pull_buffer.get_base_ptr(),
+                        sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
+                                       current_rank_in_expert_idx),
+                        pull_mbarrier, kHidden);
+                }
+
+                constexpr uint32_t kNumSFUint32 = kHidden / 128;
+                DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
+                const auto remote_sf_ptr = sym_buffer.map(
+                    input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
+                    current_rank_in_expert_idx);
+                const auto local_sf_ptr = l1_sf_buffer.get_base_ptr<uint32_t>();
+                const auto sf_pool_token_idx = expert_pool_block_offset * SF_BLOCK_M +
+                    transform_sf_token_idx(token_idx_in_expert);
+                #pragma unroll
+                for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    if (j < kNumSFUint32)
+                        local_sf_ptr[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = remote_sf_ptr[j];
+                }
             }
             __syncwarp();
 
-            // Load and store SF (overlaps with TMA token load)
-            constexpr uint32_t kNumSFUint32 = kHidden / 128;
-            DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = sym_buffer.map(
-                input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
-                current_rank_in_expert_idx);
-            const auto local_sf_ptr = l1_sf_buffer.get_base_ptr<uint32_t>();
-            const auto sf_pool_token_idx = expert_pool_block_offset * SF_BLOCK_M +
-                transform_sf_token_idx(token_idx_in_expert);
-            #pragma unroll
-            for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
-                const uint32_t j = i * 32 + lane_idx;
-                if (j < kNumSFUint32)
-                    local_sf_ptr[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = remote_sf_ptr[j];
-            }
-            __syncwarp();
-
-            // Store weights and token data
             const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
             if (cute::elect_one_sync()) {
-                // Load weights
-                const auto weight = *sym_buffer.map(
-                    input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                    current_rank_in_expert_idx);
-                *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
+                if constexpr (kEnablePull) {
+                    const auto weight = *sym_buffer.map(
+                        input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+                        current_rank_in_expert_idx);
+                    *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
+                }
 
-                // Wait for TMA token load to complete
-                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
+                ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kEnablePull ? kHidden : 0u);
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
 
                 // Store token to local L1 buffer via TMA
@@ -658,15 +678,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for tokens with SFA
+        uint32_t num_l1_blocks_counted = 0, num_l2_blocks_counted = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            if (block_phase == sched::BlockPhase::Linear1)
+                ++ num_l1_blocks_counted;
+            else
+                ++ num_l2_blocks_counted;
+
             const auto tensor_map_a_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = block_phase == sched::BlockPhase::Linear2
@@ -727,6 +754,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
         });
+        if (lane_idx == 0 and profiler_buffer != nullptr) {
+            profiler_buffer[kNumSMs * 8 + sm_idx * 2 + 0] = static_cast<uint64_t>(num_l1_blocks_counted);
+            profiler_buffer[kNumSMs * 8 + sm_idx * 2 + 1] = static_cast<uint64_t>(num_l2_blocks_counted);
+        }
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -878,6 +909,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (current_iter_idx > 0) {
                 const auto accum_phase_idx = ((current_iter_idx - 1) / kNumEpilogueStages) & 1;
                 tmem_empty_barriers[(current_iter_idx - 1) % kNumEpilogueStages]->wait(accum_phase_idx);
+            }
+
+            // Compute span end: after MMA for_each_block and final tmem barrier
+            if (lane_idx == 0 and profiler_buffer != nullptr) {
+                profiler_buffer[kNumSMs * 4 + sm_idx * 4 + 2] = static_cast<uint64_t>(clock64());
+                profiler_buffer[kNumSMs * 4 + sm_idx * 4 + 3] = read_globaltimer_ns();
             }
         }
     } else if (warp_idx == kNumDispatchWarps + 3) {
@@ -1215,7 +1252,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto dst_ptr = math::advance_ptr<float4>(
                             dst_token.get_base_ptr(),
                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        if constexpr (kEnableCombine)
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                     }
                 }
 
@@ -1228,6 +1266,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // NOTES: must be called by the same logical warp ID on both CTAs
         if (epilogue_warp_idx == 0)
             Allocator().free(0, kNumTmemCols);
+
+        // Per-SM profiler: end timing
+        if (epilogue_warp_idx == 0 and lane_idx == 0 and profiler_buffer != nullptr) {
+            profiler_buffer[sm_idx * 4 + 2] = static_cast<uint64_t>(clock64());
+            profiler_buffer[sm_idx * 4 + 3] = read_globaltimer_ns();
+        }
 
         // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
@@ -1371,6 +1415,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
     }
+
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");

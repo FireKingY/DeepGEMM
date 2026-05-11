@@ -544,6 +544,11 @@ def _median(values: Sequence[float]) -> float:
     return statistics.median(values) if values else float('nan')
 
 
+def _isnan(x: float) -> bool:
+    import math
+    return math.isnan(x)
+
+
 def run_nvml_monitor(
     *,
     config: NvmlMonitorConfig,
@@ -578,14 +583,17 @@ def run_nvml_monitor(
         write_iteration_csv(iter_path, rows)
         paths['violation_scatter'] = iter_path
 
-        # Cross-check report (experiment A + AC-8): compare NVML SM clock
-        # median to kernel-internal MHz median over the same iteration window.
-        nvml_mhzs = [r.avg_sm_mhz for r in rows]
-        kern_mhzs = [r.kernel_internal_mhz for r in rows if r.kernel_internal_mhz == r.kernel_internal_mhz]
-        nvml_med = _median(nvml_mhzs)
-        kern_med = _median(kern_mhzs) if kern_mhzs else float('nan')
-        if kern_mhzs and kern_med == kern_med and nvml_med == nvml_med and kern_med > 0:
-            delta_pct = (nvml_med - kern_med) / kern_med * 100.0
+        # Cross-check report: compare NVML SM clock median to the kernel-
+        # internal MHz median over the same iteration window. The kernel-
+        # internal list filters NaN; _median(non-empty) returns a real number,
+        # so once we know kern_mhzs is non-empty we only need to guard against
+        # division by zero.
+        nvml_med = _median([r.avg_sm_mhz for r in rows])
+        kern_mhzs = [r.kernel_internal_mhz for r in rows
+                     if not _isnan(r.kernel_internal_mhz)]
+        if kern_mhzs:
+            kern_med = _median(kern_mhzs)
+            delta_pct = (nvml_med - kern_med) / kern_med * 100.0 if kern_med > 0 else float('nan')
             log(f'[nvml rank {rank_idx}] cross-check: NVML SM median={nvml_med:.0f} MHz, '
                 f'kernel-internal median={kern_med:.0f} MHz, delta={delta_pct:+.2f}%')
         else:

@@ -322,36 +322,65 @@ class LockedClock:
 @dataclass
 class IterationRow:
     iteration: int
-    wall_time_us: float
-    avg_sm_mhz: float            # NVML reading right after the launch
-    violation_delta_ns: int      # cumulative violation diff over the iter
-    power_watts: float           # NVML power right after the launch
-    kernel_internal_mhz: float = float('nan')  # from clock64()/globaltimer
+    kernel_gpu_us: float         # GPU-side duration of run_fused() via CUDA Event (L2-cold when flush_l2 is on); excludes L2 flush time
+    nvml_sm_mhz_post_sync: float # NVML single-point SM clock read after sync; reflects post-kernel state (driver cache lag 10-100ms), NOT kernel-time average
+    violation_delta_ns: int      # cumulative violation diff bracketing only the kernel (L2 flush window excluded)
+    power_watts_post_sync: float # NVML single-point power read after sync; reflects post-kernel state, hardware sensor already does a few-ms sliding average
+    kernel_internal_mhz: float = float('nan')             # KERNEL SPAN, median across SMs (back-compat)
+    kernel_internal_mhz_mean_sm: float = float('nan')      # KERNEL SPAN, mean across SMs; whole kernel including dispatch/combine
+    kernel_internal_mhz_compute_mean_sm: float = float('nan')  # COMPUTE SPAN (dispatch-barrier -> MMA-end, leader CTA only), mean across the leader-CTA SMs that wrote it
 
 
-def _kernel_internal_median_mhz(prof_buf, num_sms: int) -> float:
-    """Median per-SM MHz parsed from the ``prof_buf`` layout used in
-    ``test_mega_moe.py`` (4 uint64 per SM for kernel span: clk_s, gt_s,
-    clk_e, gt_e)."""
+def _kernel_internal_stats_mhz(prof_buf, num_sms: int) -> Tuple[float, float, float]:
+    """Per-iter per-SM MHz parsed from ``prof_buf``.
+
+    Layout (matches ``test_mega_moe.py`` profiler_buf, 10 uint64 per SM):
+      [0..4): kernel span  (clk_s, gt_s, clk_e, gt_e)  — every SM writes
+      [4..8): compute span (ccs,   cgs,  cce,  cge)    — leader CTA only
+      [8..10): block counts (nl1, nl2)
+
+    Returns (kernel_span_median_sm, kernel_span_mean_sm, compute_span_mean_sm).
+    The compute span is the narrower dispatch-barrier -> MMA-end window.
+    NaN if data missing.
+    """
+    nan = float('nan')
     if prof_buf is None:
-        return float('nan')
+        return nan, nan, nan
     try:
         import numpy as np
         import statistics
     except Exception:
-        return float('nan')
+        return nan, nan, nan
     raw = prof_buf.cpu().numpy().view(np.uint64)
     if raw.size < num_sms * 4:
-        return float('nan')
+        return nan, nan, nan
     kern = raw[:num_sms * 4].reshape(num_sms, 4)
-    mhz_vals: List[float] = []
+    kern_mhz: List[float] = []
     for sm in range(num_sms):
         cs, gs, ce, ge = int(kern[sm, 0]), int(kern[sm, 1]), int(kern[sm, 2]), int(kern[sm, 3])
         if ce > cs and ge > gs:
-            mhz_vals.append((ce - cs) * 1000.0 / (ge - gs))
-    if not mhz_vals:
-        return float('nan')
-    return statistics.median(mhz_vals)
+            kern_mhz.append((ce - cs) * 1000.0 / (ge - gs))
+    if not kern_mhz:
+        return nan, nan, nan
+    kern_med = statistics.median(kern_mhz)
+    kern_mean = statistics.mean(kern_mhz)
+    # Compute span: leader CTA only, may have fewer valid entries
+    if raw.size >= num_sms * 8:
+        comp = raw[num_sms * 4:num_sms * 8].reshape(num_sms, 4)
+        comp_mhz: List[float] = []
+        for sm in range(num_sms):
+            ccs, cgs, cce, cge = int(comp[sm, 0]), int(comp[sm, 1]), int(comp[sm, 2]), int(comp[sm, 3])
+            if cce > ccs and cge > cgs:
+                comp_mhz.append((cce - ccs) * 1000.0 / (cge - cgs))
+        comp_mean = statistics.mean(comp_mhz) if comp_mhz else nan
+    else:
+        comp_mean = nan
+    return kern_med, kern_mean, comp_mean
+
+
+def _kernel_internal_median_mhz(prof_buf, num_sms: int) -> float:
+    """Back-compat shim — returns just the kernel-span median."""
+    return _kernel_internal_stats_mhz(prof_buf, num_sms)[0]
 
 
 def run_violation_scatter(
@@ -362,18 +391,47 @@ def run_violation_scatter(
     sync: Callable[[], None],
     prof_buf=None,
     num_sms: int = 0,
+    distributed_barrier: Optional[Callable[[], None]] = None,
+    flush_l2: bool = True,
+    l2_flush_bytes: int = 8 * 1024 * 1024 * 1024,  # 8 GB; B200 L2 is 60-120 MB
 ) -> List[IterationRow]:
-    """Per-iteration violation snapshot and wall-clock timing.
+    """Per-iteration violation snapshot and GPU-side kernel timing.
 
-    When ``prof_buf`` is supplied, each iteration also re-runs the kernel with
-    the profiler attached so the kernel-internal MHz can be captured for cross
-    check (CSV column ``kernel_internal_mhz``).
+    Each iteration follows bench_kineto-style hygiene:
+      1. zero an ``l2_flush_bytes`` buffer to flush L2 (default 8 GB)
+      2. sync + (optional) cross-rank barrier so the NVML window is not
+         polluted by flush activity or rank misalignment
+      3. open the NVML window: read ``violation_status``, record start CUDA
+         event, run the kernel, record end event, sync, read ``violation_status``
+      4. close the NVML window before allocating ``power_watts_post_sync`` /
+         ``nvml_sm_mhz_post_sync`` snapshots
+
+    ``violation_delta_ns`` and the CUDA-event ``kernel_gpu_us`` therefore cover
+    only the kernel itself, never the flush.
+
+    When ``prof_buf`` is supplied, the same flushed kernel run also exposes the
+    in-kernel ``clock64()``+``globaltimer`` profiler (CSV column
+    ``kernel_internal_mhz``).
     """
     import torch
     rows: List[IterationRow] = []
     start_evt = torch.cuda.Event(enable_timing=True)
     end_evt = torch.cuda.Event(enable_timing=True)
+    flush_buf = None
+    if flush_l2:
+        # int32 buffer; 8 GB write per iter is plenty to evict B200 L2 (60-120 MB)
+        flush_buf = torch.empty(l2_flush_bytes // 4, dtype=torch.int32, device='cuda')
     for i in range(n_iter):
+        # --- L2 flush (outside the NVML window, outside the CUDA-event window) ---
+        if flush_buf is not None:
+            flush_buf.zero_()
+            sync()
+        if distributed_barrier is not None:
+            # Align all ranks before opening the NVML window. Without this the
+            # rank that finished its flush first would start reading NVML while
+            # other ranks are still flushing, smearing the violation window.
+            distributed_barrier()
+        # --- NVML window opens ---
         before_ns = session.violation_status_power_ns()
         start_evt.record()
         if prof_buf is not None:
@@ -382,19 +440,27 @@ def run_violation_scatter(
             run_fused()
         end_evt.record()
         sync()
-        wall_us = start_evt.elapsed_time(end_evt) * 1000.0  # ms -> us
+        kernel_gpu_us = start_evt.elapsed_time(end_evt) * 1000.0  # ms -> us
         after_ns = session.violation_status_power_ns()
         delta = max(0, after_ns - before_ns)
+        # --- NVML window closes ---
         nvml_mhz = float(session.sm_clock_mhz())
         nvml_w = session.power_milliwatts() / 1000.0
-        kern_mhz = _kernel_internal_median_mhz(prof_buf, num_sms) if prof_buf is not None else float('nan')
+        if prof_buf is not None:
+            kern_mhz_med, kern_mhz_mean, comp_mhz_mean = _kernel_internal_stats_mhz(prof_buf, num_sms)
+        else:
+            kern_mhz_med = float('nan')
+            kern_mhz_mean = float('nan')
+            comp_mhz_mean = float('nan')
         rows.append(IterationRow(
             iteration=i,
-            wall_time_us=wall_us,
-            avg_sm_mhz=nvml_mhz,
+            kernel_gpu_us=kernel_gpu_us,
+            nvml_sm_mhz_post_sync=nvml_mhz,
             violation_delta_ns=delta,
-            power_watts=nvml_w,
-            kernel_internal_mhz=kern_mhz,
+            power_watts_post_sync=nvml_w,
+            kernel_internal_mhz=kern_mhz_med,
+            kernel_internal_mhz_mean_sm=kern_mhz_mean,
+            kernel_internal_mhz_compute_mean_sm=comp_mhz_mean,
         ))
         if prof_buf is not None:
             prof_buf.zero_()
@@ -464,14 +530,17 @@ def write_iteration_csv(path: str, rows: Sequence[IterationRow]):
     with _open_no_clobber(path) as f:
         w = csv.writer(f)
         w.writerow([
-            'iteration', 'wall_time_us', 'avg_sm_mhz', 'violation_delta_ns',
-            'power_watts', 'kernel_internal_mhz',
+            'iteration', 'kernel_gpu_us', 'nvml_sm_mhz_post_sync', 'violation_delta_ns',
+            'power_watts_post_sync', 'kernel_internal_mhz', 'kernel_internal_mhz_mean_sm',
+            'kernel_internal_mhz_compute_mean_sm',
         ])
         for r in rows:
             w.writerow([
-                r.iteration, f'{r.wall_time_us:.3f}', f'{r.avg_sm_mhz:.1f}',
-                r.violation_delta_ns, f'{r.power_watts:.3f}',
+                r.iteration, f'{r.kernel_gpu_us:.3f}', f'{r.nvml_sm_mhz_post_sync:.1f}',
+                r.violation_delta_ns, f'{r.power_watts_post_sync:.3f}',
                 f'{r.kernel_internal_mhz:.1f}' if r.kernel_internal_mhz == r.kernel_internal_mhz else '',
+                f'{r.kernel_internal_mhz_mean_sm:.1f}' if r.kernel_internal_mhz_mean_sm == r.kernel_internal_mhz_mean_sm else '',
+                f'{r.kernel_internal_mhz_compute_mean_sm:.1f}' if r.kernel_internal_mhz_compute_mean_sm == r.kernel_internal_mhz_compute_mean_sm else '',
             ])
 
 
@@ -578,6 +647,7 @@ def run_nvml_monitor(
         rows = run_violation_scatter(
             session=session, run_fused=run_fused, n_iter=config.n_iter_violation,
             sync=sync, prof_buf=cross_buf, num_sms=num_sms,
+            distributed_barrier=distributed_barrier,
         )
         iter_path = os.path.join(config.out_dir, f'nvml_rank{rank_idx}_violation.csv')
         write_iteration_csv(iter_path, rows)
@@ -588,7 +658,7 @@ def run_nvml_monitor(
         # internal list filters NaN; _median(non-empty) returns a real number,
         # so once we know kern_mhzs is non-empty we only need to guard against
         # division by zero.
-        nvml_med = _median([r.avg_sm_mhz for r in rows])
+        nvml_med = _median([r.nvml_sm_mhz_post_sync for r in rows])
         kern_mhzs = [r.kernel_internal_mhz for r in rows
                      if not _isnan(r.kernel_internal_mhz)]
         if kern_mhzs:

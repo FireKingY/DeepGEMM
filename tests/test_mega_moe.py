@@ -306,6 +306,29 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                       (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
 
+    # Capture kernel-span + compute-span wall_us via prof_buf BEFORE bench_kineto.
+    # The per-SM profiling section later in this file can crash with
+    # cudaErrorLaunchFailure on post-bench_kineto state, so we collect this
+    # data here to make sure it always survives. bench_kineto runs its own
+    # warmup downstream, so no warmup needed here.
+    import numpy as _np
+    prof_buf.zero_()
+    run_fused(profiler_buf=prof_buf)
+    torch.cuda.synchronize()
+    _raw = prof_buf.cpu().numpy().view(_np.uint64)
+    _kt = _raw[:num_sms * 4].reshape(num_sms, 4)
+    _ct = _raw[num_sms * 4:num_sms * 8].reshape(num_sms, 4)
+    _kgs = [int(_kt[s, 1]) for s in range(num_sms) if int(_kt[s, 2]) > int(_kt[s, 0])]
+    _kge = [int(_kt[s, 3]) for s in range(num_sms) if int(_kt[s, 2]) > int(_kt[s, 0])]
+    _cgs = [int(_ct[s, 1]) for s in range(num_sms) if int(_ct[s, 2]) > int(_ct[s, 0])]
+    _cge = [int(_ct[s, 3]) for s in range(num_sms) if int(_ct[s, 2]) > int(_ct[s, 0])]
+    if _kgs and _cgs:
+        _kw = (max(_kge) - min(_kgs)) / 1000.0
+        _cw = (max(_cge) - min(_cgs)) / 1000.0
+        dist_print(f' > [BENCH_SPAN] rank={rank_idx} kernel_span_us={_kw:.3f} compute_span_us={_cw:.3f} n_leader_sms={len(_cgs)}',
+                   once_in_node=False)
+    prof_buf.zero_()
+
     # Benchmark — optionally run multiple times and trim worst 20% (env: DG_NUM_BENCH_RUNS)
     _num_bench_runs = int(os.environ.get('DG_NUM_BENCH_RUNS', '1'))
     _bench_args = dict(
@@ -354,7 +377,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                f'NVL {nvlink_gbs * approx_factor:3.0f} GB/s | '
                f'{t_fused * 1e6:4.0f} us, '
                f'reduction: {t_reduction * 1e6:4.1f} us | '
+               f'recv_tokens={num_recv_tokens} touched_experts={num_touched_experts} | '
                f'{safe_div(t_baseline, t_fused):.2f}x legacy')
+
+    # Print rank 0's per-expert receive distribution for FLOPS-vs-load analysis
+    if rank_idx == 0:
+        rank0_topk_filtered = gathered_topk_idx[gathered_topk_idx >= 0]
+        rank0_expert_counts = torch.bincount(rank0_topk_filtered, minlength=num_experts)[:num_experts_per_rank].tolist()
+        dist_print(f' > [BENCH_META] rank=0 num_tokens_in={num_tokens} num_recv_tokens={num_recv_tokens} '
+                   f'num_touched_experts={num_touched_experts} '
+                   f'per_expert_counts={",".join(str(c) for c in rank0_expert_counts)}', once_in_node=False)
 
     # Per-SM profiling: timing + block counts + TFLOPS
     import numpy as np, statistics
